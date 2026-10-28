@@ -5,11 +5,13 @@ import os
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-from engine import (REPORTS_DIR, SCREENSHOTS_DIR, cleanup_screenshot_folders,
-                    clear_screenshot_folders, improve_prompt, migrate_vision_mode,
-                    open_report_in_notepad, run_task)
+from engine import (REPORTS_DIR, SCREENSHOTS_DIR, SKILLS_DIR, cleanup_screenshot_folders,
+                    clear_screenshot_folders, delete_skill, extract_skill, improve_prompt,
+                    list_skills, load_skill, migrate_vision_mode, open_report_in_notepad,
+                    redact_skill_secrets, run_task, save_skill, skill_exists, suggest_skill_name,
+                    validate_skill_name)
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -28,6 +30,10 @@ class App:
         self.stop = threading.Event()
         self.plan_rows = {}
         self.latest_report_path = ""
+        self._skill_candidate = None
+        self._skills_window = None
+        self._skill_tree = None
+        self._skill_search_var = None
         self._undo_original = None
         self._setting_task_text = False
         self._improving = False
@@ -74,6 +80,10 @@ class App:
         self.improve_btn.pack(fill="x")
         self.undo_btn = tk.Button(task_buttons, text="Undo", command=self.undo_improvement, state="disabled")
         self.undo_btn.pack(fill="x", pady=(4, 0))
+        self.save_skill_btn = tk.Button(task_buttons, text="Save as skill", command=self.save_task_as_skill,
+                                        state="disabled")
+        self.save_skill_btn.pack(fill="x", pady=(4, 0))
+        tk.Button(task_buttons, text="Skills", command=self.open_skills_window).pack(fill="x", pady=(4, 0))
         self.task.edit_modified(False)
         self.task.bind("<<Modified>>", self._task_modified)
 
@@ -138,6 +148,24 @@ class App:
             self._render_plan_checklist(event.get("goal", ""), event.get("steps", []), note=note)
             self._append(stamp, "Plan created: " + event.get("goal", "") + (" — " + note if note else ""))
             return
+        if kind == "skill_loaded":
+            self._append(stamp, f"Skill loaded: @{event.get('name', '')}")
+            return
+        if kind == "skill_save_offered":
+            self._skill_candidate = event.get("candidate")
+            self.save_skill_btn.configure(state="normal" if self._skill_candidate else "disabled")
+            self._append(stamp, "Save as skill is available for this clean success.")
+            if event.get("secrets_redacted"):
+                self._append(stamp, "WARNING: Credential-like text was replaced with skill slots.")
+                messagebox.showwarning("Skill secrets", "Credential-like text was replaced with slots before saving.",
+                                       parent=self.root)
+            return
+        if kind == "skill_saved":
+            self._append(stamp, f"Skill saved: @{event.get('name', '')}")
+            self._skill_candidate = None
+            self.save_skill_btn.configure(state="disabled")
+            self._refresh_skills_tree()
+            return
         if kind == "replan":
             self._render_plan_checklist(event.get("goal", ""), event.get("steps", []),
                                         event.get("completed_ids", []))
@@ -197,7 +225,10 @@ class App:
                          f" | Vision {event.get('vision_used', 'no')}" +
                          f" | Re-plans {event.get('replans', 0)}" +
                          f" | Total API calls {event.get('total_api_calls', event.get('api_calls', 0))}" +
+                         f" | Skill {'@' + event.get('skill_name', '') if event.get('skill_name') else 'none'}" +
                          f" | {event.get('seconds', 0)} seconds")
+            if self._skills_window and self._skills_window.winfo_exists():
+                self._refresh_skills_tree()
 
     def _set_step(self, step_id, state):
         label = self.plan_rows.get(step_id)
@@ -305,6 +336,220 @@ class App:
         dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog(False))
         dialog.grab_set()
 
+    def save_task_as_skill(self):
+        candidate = self._skill_candidate
+        if not candidate:
+            return
+        self.save_skill_btn.configure(state="disabled")
+        settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
+                    "model": self.model.get().strip()}
+
+        def worker():
+            try:
+                extracted = extract_skill(candidate, settings)
+                error = ""
+            except Exception as exc:
+                extracted = None
+                error = " ".join(str(exc).split())[:240] or "The skill could not be extracted."
+            self.root.after(0, self._skill_extraction_finished, candidate, extracted, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _skill_extraction_finished(self, candidate, extracted, error):
+        if error or not extracted:
+            self.save_skill_btn.configure(state="normal" if self._skill_candidate else "disabled")
+            messagebox.showerror("Save as skill", error or "The extractor returned no skill.", parent=self.root)
+            return
+        self._show_skill_preview(candidate, extracted)
+
+    def _show_skill_preview(self, candidate, extracted):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Save reusable skill")
+        dialog.geometry("600x520")
+        dialog.transient(self.root)
+        tk.Label(dialog, text="Skill name (shown as @name)").pack(anchor="w", padx=10, pady=(10, 2))
+        name_var = tk.StringVar(value=suggest_skill_name(candidate.get("original_task", ""),
+                                                         candidate.get("goal", "")))
+        name_entry = tk.Entry(dialog, textvariable=name_var)
+        name_entry.pack(fill="x", padx=10)
+        preview_time = datetime.now().astimezone().isoformat(timespec="seconds")
+        preview = {"name": "@" + name_var.get(), **extracted,
+                   "created": preview_time, "updated": preview_time, "uses": 0, "last_used": None,
+                   "original_task": candidate.get("original_task", ""),
+                   "goal": candidate.get("goal", ""), "steps": candidate.get("steps", []),
+                   "needs_vision": candidate.get("needs_vision", False)}
+        preview_box = tk.Text(dialog, wrap="word")
+        preview_box.pack(fill="both", expand=True, padx=10, pady=8)
+        preview_box.insert("1.0", json.dumps(preview, ensure_ascii=False, indent=2))
+        preview_box.configure(state="disabled")
+
+        def refresh_preview_name(*_args):
+            preview["name"] = "@" + name_var.get()
+            preview_box.configure(state="normal")
+            preview_box.delete("1.0", "end")
+            preview_box.insert("1.0", json.dumps(preview, ensure_ascii=False, indent=2))
+            preview_box.configure(state="disabled")
+
+        name_var.trace_add("write", refresh_preview_name)
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+
+        def save_preview():
+            try:
+                name = validate_skill_name(name_var.get())
+            except ValueError as exc:
+                messagebox.showerror("Invalid skill name", str(exc), parent=dialog)
+                return
+            name_var.set(name)
+            if skill_exists(name, SKILLS_DIR) and not messagebox.askyesno(
+                    "Overwrite skill?", f"@{name} already exists. Replace it?", parent=dialog):
+                return
+            skill = {"description": extracted["description"],
+                     "variables": extracted["variables"], "trace": extracted["trace"],
+                     "hints": extracted["hints"],
+                     "original_task": candidate.get("original_task", ""),
+                     "goal": candidate.get("goal", ""), "steps": candidate.get("steps", []),
+                     "needs_vision": candidate.get("needs_vision", False)}
+            skill, pre_save_redaction = redact_skill_secrets(skill)
+            if pre_save_redaction:
+                messagebox.showwarning("Skill secrets", "Credential-like text was replaced with slots before saving.",
+                                       parent=dialog)
+            try:
+                _saved, secrets_redacted = save_skill(skill, name, SKILLS_DIR, overwrite=True)
+            except Exception as exc:
+                messagebox.showerror("Save as skill", "Could not save skill: " + str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            self.emit({"type": "skill_saved", "time": "", "name": name})
+            if secrets_redacted:
+                messagebox.showwarning("Skill secrets", "Credential-like text was replaced with slots.",
+                                       parent=self.root)
+
+        def cancel_preview():
+            dialog.destroy()
+            self.save_skill_btn.configure(state="normal" if self._skill_candidate else "disabled")
+
+        tk.Button(buttons, text="Save", command=save_preview).pack(side="left")
+        tk.Button(buttons, text="Cancel", command=cancel_preview).pack(side="left", padx=6)
+        dialog.protocol("WM_DELETE_WINDOW", cancel_preview)
+        dialog.grab_set()
+        name_entry.focus_set()
+
+    def open_skills_window(self):
+        if self._skills_window and self._skills_window.winfo_exists():
+            self._skills_window.lift()
+            self._refresh_skills_tree()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Saved skills")
+        window.geometry("760x400")
+        self._skills_window = window
+        search_row = tk.Frame(window)
+        search_row.pack(fill="x", padx=10, pady=8)
+        tk.Label(search_row, text="Search:").pack(side="left")
+        self._skill_search_var = tk.StringVar()
+        search_entry = tk.Entry(search_row, textvariable=self._skill_search_var)
+        search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        columns = ("name", "description", "uses", "last_used")
+        self._skill_tree = ttk.Treeview(window, columns=columns, show="headings", selectmode="browse")
+        for column, label, width in (("name", "Name", 130), ("description", "Description", 340),
+                                     ("uses", "Uses", 60), ("last_used", "Last used", 150)):
+            self._skill_tree.heading(column, text=label)
+            self._skill_tree.column(column, width=width, anchor="w")
+        self._skill_tree.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        buttons = tk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Button(buttons, text="Use", command=self._use_selected_skill).pack(side="left")
+        tk.Button(buttons, text="View", command=self._view_selected_skill).pack(side="left", padx=6)
+        tk.Button(buttons, text="Edit description", command=self._edit_selected_skill).pack(side="left", padx=6)
+        tk.Button(buttons, text="Delete", command=self._delete_selected_skill).pack(side="left", padx=6)
+        self._skill_search_var.trace_add("write", lambda *_: self._refresh_skills_tree())
+        window.protocol("WM_DELETE_WINDOW", self._close_skills_window)
+        self._refresh_skills_tree()
+        search_entry.focus_set()
+
+    def _close_skills_window(self):
+        if self._skills_window and self._skills_window.winfo_exists():
+            self._skills_window.destroy()
+        self._skills_window = None
+        self._skill_tree = None
+
+    def _refresh_skills_tree(self):
+        tree = self._skill_tree
+        if not tree or not tree.winfo_exists():
+            return
+        query = (self._skill_search_var.get() if self._skill_search_var else "").casefold()
+        for row in tree.get_children():
+            tree.delete(row)
+        try:
+            skills = list_skills(SKILLS_DIR)
+        except OSError as exc:
+            self._append(datetime.now().astimezone().isoformat(timespec="seconds"),
+                         f"Could not read skills: {exc}")
+            return
+        for skill in skills:
+            values = ("@" + skill["name"], skill["description"], skill["uses"], skill.get("last_used") or "Never")
+            if query and query not in " ".join(str(value) for value in values).casefold():
+                continue
+            tree.insert("", "end", iid=skill["name"], values=values)
+
+    def _selected_skill_name(self):
+        if not self._skill_tree or not self._skill_tree.winfo_exists():
+            return ""
+        selected = self._skill_tree.selection()
+        return selected[0] if selected else ""
+
+    def _view_selected_skill(self):
+        name = self._selected_skill_name()
+        if not name:
+            return
+        skill = load_skill(name, SKILLS_DIR)
+        dialog = tk.Toplevel(self._skills_window)
+        dialog.title("View @" + name)
+        dialog.geometry("600x500")
+        box = tk.Text(dialog, wrap="word")
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("1.0", json.dumps(skill, ensure_ascii=False, indent=2))
+        box.configure(state="disabled")
+
+    def _edit_selected_skill(self):
+        name = self._selected_skill_name()
+        if not name:
+            return
+        skill = load_skill(name, SKILLS_DIR)
+        description = simpledialog.askstring("Edit description", f"Description for @{name}:",
+                                             initialvalue=skill["description"], parent=self._skills_window)
+        if description is None:
+            return
+        skill["description"] = description.strip()
+        skill, pre_save_redaction = redact_skill_secrets(skill)
+        if pre_save_redaction:
+            messagebox.showwarning("Skill secrets", "Credential-like text was replaced with slots before saving.",
+                                   parent=self._skills_window)
+        try:
+            _saved, redacted = save_skill(skill, name, SKILLS_DIR, overwrite=True)
+        except Exception as exc:
+            messagebox.showerror("Edit skill", str(exc), parent=self._skills_window)
+            return
+        self._refresh_skills_tree()
+        if redacted:
+            messagebox.showwarning("Skill secrets", "Credential-like text was replaced with slots.",
+                                   parent=self._skills_window)
+
+    def _delete_selected_skill(self):
+        name = self._selected_skill_name()
+        if not name or not messagebox.askyesno("Delete skill", f"Delete @{name}?", parent=self._skills_window):
+            return
+        delete_skill(name, SKILLS_DIR)
+        self._refresh_skills_tree()
+
+    def _use_selected_skill(self):
+        name = self._selected_skill_name()
+        if not name:
+            return
+        self.task.insert("1.0", f"@{name} ")
+        self.task.focus_set()
+
     def open_latest_report(self):
         if not self.latest_report_path:
             messagebox.showinfo("Reports", "No report has been saved yet.", parent=self.root)
@@ -350,6 +595,8 @@ class App:
             self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
             return
         self._clear_undo()
+        self._skill_candidate = None
+        self.save_skill_btn.configure(state="disabled")
         self.stop.clear()
         self.run_btn.configure(state="disabled")
         self.improve_btn.configure(state="disabled")

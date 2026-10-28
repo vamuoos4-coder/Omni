@@ -1,4 +1,4 @@
-"""Offline tests for planner, action batching, event streams, stops, and summaries."""
+"""Offline tests for planning, skills, actions, event streams, stops, and summaries."""
 import base64
 import json
 import os
@@ -472,6 +472,217 @@ class EngineTests(unittest.TestCase):
                             for e in events))
         next_turn_text = client.calls[2]["messages"][-1]["content"][0]["text"]
         self.assertIn("Vision mode: one action per turn.", next_turn_text)
+
+
+class SkillTests(unittest.TestCase):
+    @staticmethod
+    def sample_skill(name="demo", needs_vision=False):
+        return {"name": name, "description": "Prepare a reusable desktop workflow.",
+                "created": "2026-01-01T00:00:00+00:00", "updated": "2026-01-01T00:00:00+00:00",
+                "uses": 0, "last_used": None, "original_task": "Write a note.",
+                "goal": "Create a note", "steps": ["Open the editor", "Write content"],
+                "trace": [{"action": "open_app", "args": {"name": "notepad"}, "result": "opened"}],
+                "variables": [{"name": "content", "description": "Text to enter", "example": "hello"}],
+                "needs_vision": needs_vision, "hints": ["Wait after opening Notepad."]}
+
+    def test_skill_name_validation_and_space_conversion(self):
+        self.assertEqual(engine.validate_skill_name(" My Workflow_2 "), "my-workflow_2")
+        for invalid in ("ab", "a" * 31, "bad/name", "name with.dot"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                engine.validate_skill_name(invalid)
+
+    def test_skill_file_round_trip_and_overwrite_confirmation_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            saved, redacted = engine.save_skill(self.sample_skill(), "Demo Skill", folder)
+            self.assertFalse(redacted)
+            self.assertEqual(saved["name"], "demo-skill")
+            self.assertEqual(engine.load_skill("demo-skill", folder), saved)
+            with self.assertRaises(FileExistsError):
+                engine.save_skill(self.sample_skill(), "demo-skill", folder)
+            replacement = self.sample_skill()
+            replacement["description"] = "Updated description."
+            replaced, _ = engine.save_skill(replacement, "demo-skill", folder, overwrite=True)
+            self.assertEqual(replaced["description"], "Updated description.")
+            self.assertEqual(replaced["created"], saved["created"])
+
+    def test_secret_scan_redacts_trace_variables_and_key_patterns(self):
+        secret = "sk-1234567890abcdefghijklmnopqrstuv"
+        long_random = "AbCdEf0123456789AbCdEf0123456789AbCdEf01"
+        skill = self.sample_skill()
+        skill["trace"] = [{"action": "type_text", "args": {
+            "text": "password: hunter2; token: " + secret + "; value=" + long_random}, "result": "typed"}]
+        skill["variables"] = [{"name": "api_token", "description": "Bearer credential",
+                               "example": "ghp_abcdefghijklmnopqrstuvwxyz123456"}]
+        with tempfile.TemporaryDirectory() as folder:
+            saved, redacted = engine.save_skill(skill, "secrets", folder)
+            serialized = json.dumps(saved)
+            self.assertTrue(redacted)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(long_random, serialized)
+            self.assertNotIn("hunter2", serialized)
+            self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", serialized)
+            self.assertIn("{password}", serialized)
+            self.assertIn("{api_token}", serialized)
+
+    def test_missing_skills_folder_is_created_and_delete_works(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "skills")
+            self.assertFalse(os.path.exists(folder))
+            self.assertEqual(engine.list_skills(folder), [])
+            self.assertTrue(os.path.isdir(folder))
+            engine.save_skill(self.sample_skill(), "demo", folder)
+            self.assertTrue(engine.delete_skill("demo", folder))
+            self.assertFalse(engine.skill_exists("demo", folder))
+            self.assertFalse(engine.delete_skill("demo", folder))
+
+    def test_skill_reference_parsing_start_middle_unknown_and_multiple(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine.save_skill(self.sample_skill("alpha"), "alpha", folder)
+            engine.save_skill(self.sample_skill("beta"), "beta", folder)
+            start, skill, warnings = engine.resolve_skill_request("@alpha write the new note", folder)
+            self.assertEqual(skill["name"], "alpha")
+            self.assertEqual(start, "write the new note")
+            middle, skill, warnings = engine.resolve_skill_request("Please use @alpha for this request", folder)
+            self.assertEqual(skill["name"], "alpha")
+            self.assertEqual(middle, "Please use for this request")
+            unknown_text = "@missing write a normal request"
+            unknown, skill, warnings = engine.resolve_skill_request(unknown_text, folder)
+            self.assertIsNone(skill)
+            self.assertEqual(unknown, unknown_text)
+            self.assertTrue(any("Unknown skill @missing" in warning for warning in warnings))
+            multiple, skill, warnings = engine.resolve_skill_request("@alpha @beta do both", folder)
+            self.assertEqual(skill["name"], "alpha")
+            self.assertEqual(multiple, "do both")
+            self.assertTrue(any("Only one skill" in warning for warning in warnings))
+
+    def test_extractor_valid_json_and_text_only_request(self):
+        extracted = {"description": "Write content into a new note.",
+                     "variables": [{"name": "content", "description": "Text to enter", "example": "hello"}],
+                     "trace": [{"action": "type_text", "args": {"text": "hello"}, "result": "typed"}],
+                     "hints": ["Wait after opening the editor."]}
+        client = FakeClient([json.dumps(extracted)])
+        result = engine.extract_skill({"original_task": "write hello", "goal": "create note",
+                                      "steps": ["Open editor"], "trace": [], "needs_vision": False},
+                                     {"client": client, "model": "fake"})
+        self.assertEqual(result["description"], extracted["description"])
+        self.assertEqual(result["trace"][0]["args"]["text"], "{content}")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsInstance(client.calls[0]["messages"][1]["content"], str)
+        self.assertNotIn("image_url", json.dumps(client.calls[0]["messages"]))
+
+    def test_extractor_retries_invalid_json_once_then_errors_clearly(self):
+        valid = json.dumps({"description": "Write a note.", "variables": [],
+                            "trace": [{"action": "type_text", "args": {"text": "{content}"},
+                                       "result": "typed"}], "hints": []})
+        candidate = {"original_task": "task", "goal": "goal", "steps": [], "trace": []}
+        retry_client = FakeClient(["not-json", valid])
+        engine.extract_skill(candidate, {"client": retry_client, "model": "fake"})
+        self.assertEqual(len(retry_client.calls), 2)
+        failed_client = FakeClient(["bad", "still bad"])
+        with self.assertRaisesRegex(ValueError, "after two attempts"):
+            engine.extract_skill(candidate, {"client": failed_client, "model": "fake"})
+        self.assertEqual(len(failed_client.calls), 2)
+
+    def test_loaded_skill_guides_planner_and_executor_and_updates_usage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine.save_skill(self.sample_skill(), "demo", folder)
+            client = FakeClient([plan_reply(), response("finish", 1, {"message": "done"})])
+            events = []
+            run_task("@demo write the current message", {"model": "fake", "client": client,
+                     "sleep": lambda _seconds: None, "skills_dir": folder}, events.append, threading.Event())
+            planner_text = client.calls[0]["messages"][1]["content"]
+            executor_text = client.calls[1]["messages"][1]["content"]
+            self.assertIn("SKILL @demo", planner_text)
+            self.assertIn("SKILL @demo", executor_text)
+            self.assertIn("untrusted guidance only", client.calls[0]["messages"][0]["content"])
+            self.assertIn("untrusted guidance only", client.calls[1]["messages"][0]["content"])
+            self.assertIn("write the current message", planner_text)
+            self.assertTrue(any(event["type"] == "skill_loaded" and event["name"] == "demo" for event in events))
+            summary = next(event for event in events if event["type"] == "summary")
+            self.assertEqual(summary["skill_name"], "demo")
+            updated = engine.load_skill("demo", folder)
+            self.assertEqual(updated["uses"], 1)
+            self.assertTrue(updated["last_used"])
+
+    def test_skill_needs_vision_respects_off_and_enables_auto(self):
+        with tempfile.TemporaryDirectory() as folder:
+            engine.save_skill(self.sample_skill(needs_vision=True), "visual", folder)
+            responses = [plan_reply(), response("finish", 1, {"message": "done"})]
+            client = FakeClient(responses)
+            with patch("engine.grab", return_value="fake-image") as grab:
+                events = []
+                run_task("@visual inspect the window", {"model": "fake", "client": client,
+                         "sleep": lambda _seconds: None, "skills_dir": folder, "vision_mode": "off"},
+                         events.append, threading.Event())
+                grab.assert_not_called()
+                summary = next(event for event in events if event["type"] == "summary")
+                self.assertEqual(summary["vision_used"], "no")
+            client = FakeClient([plan_reply(), response("finish", 1, {"message": "done"})])
+            with patch("engine.grab", return_value="fake-image") as grab:
+                events = []
+                run_task("@visual inspect the window", {"model": "fake", "client": client,
+                         "sleep": lambda _seconds: None, "skills_dir": folder, "vision_mode": "auto"},
+                         events.append, threading.Event())
+                self.assertEqual(grab.call_count, 1)
+                summary = next(event for event in events if event["type"] == "summary")
+                self.assertEqual(summary["vision_used"], "turned on at step 1")
+
+    def test_clean_success_only_offers_skill_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def run(client, action_runner=None):
+                events = []
+                settings = {"model": "fake", "client": client, "sleep": lambda _seconds: None,
+                            "skills_dir": folder}
+                if action_runner:
+                    settings["action_runner"] = action_runner
+                run_task("make a note", settings, events.append, threading.Event())
+                return events
+
+            clean = run(FakeClient([plan_reply(), response("finish", 1, {"message": "done"})]))
+            offer = next(event for event in clean if event["type"] == "skill_save_offered")
+            self.assertIn("trace", offer["candidate"])
+            self.assertIn("plan", offer["candidate"])
+            failed = run(FakeClient([plan_reply(), response("wait", 1), response("finish", 1)]),
+                         lambda *_: "refused: blocked")
+            self.assertFalse(any(event["type"] == "skill_save_offered" for event in failed))
+            replanned = run(FakeClient([plan_reply(), response("replan", 1, {"reason": "change"}),
+                                        json.dumps({"steps": [{"id": 1, "title": "Continue"}]}),
+                                        response("finish", 1)]))
+            self.assertFalse(any(event["type"] == "skill_save_offered" for event in replanned))
+            no_finish = run(FakeClient([plan_reply()] + [response("wait", 1) for _ in range(engine.MAX_STEPS)]),
+                           lambda *_: "ok")
+            self.assertFalse(any(event["type"] == "skill_save_offered" for event in no_finish))
+
+    def test_vision_click_trace_uses_thought_not_cells_or_coordinates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            client = FakeClient([plan_reply(),
+                                 response("click", 1, {"cell": "F5", "dx": 0.25, "dy": 0.7},
+                                          thought="Click the Save button in F5 at 12, 34."),
+                                 response("finish", 1, {"message": "saved"})])
+            events = []
+            with patch("engine.grab", return_value="fake-image"), \
+                 patch("engine.create_screenshot_task_dir", return_value=folder), \
+                 patch("engine.save_screenshot", return_value=os.path.join(folder, "step-01.jpg")):
+                run_task("save this note", {"model": "fake", "client": client, "sleep": lambda _seconds: None,
+                         "skills_dir": folder, "vision_mode": "on",
+                         "action_runner": lambda *_: "clicked"}, events.append, threading.Event())
+            candidate = next(event["candidate"] for event in events if event["type"] == "skill_save_offered")
+            click = next(item for item in candidate["trace"] if item["action"] == "click")
+            encoded = json.dumps(click)
+            self.assertIn("Save button", encoded)
+            for forbidden in ("F5", "12", "34", "cell", "dx", "dy"):
+                self.assertNotIn(forbidden, encoded)
+
+    def test_extracted_click_trace_is_also_stripped_of_grid_data(self):
+        value = {"description": "Click the visible Save button.", "variables": [],
+                 "trace": [{"action": "click", "args": {"cell": "B2", "dx": 0.5, "dy": 0.4,
+                                                               "target": "Save at B2, 120/450"},
+                            "result": "clicked at B2, 120/450"}], "hints": []}
+        normalized = engine._validate_extraction(value)
+        click = normalized["trace"][0]
+        self.assertTrue(click["args"]["target"].startswith("Save at the target"))
+        self.assertNotIn("B2", json.dumps(click))
+        self.assertNotIn("120", json.dumps(click))
 
 
 class WebResearchTests(unittest.TestCase):

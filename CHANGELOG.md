@@ -14,3 +14,4 @@
 - Expanded offline tests for prompt improvement, Notepad fallback, screenshot storage, click markers, and cleanup.
 - Added Off/Auto/On vision with legacy-config migration, screen-first planning, Auto escalation, bounded re-planning, and one-line screen memory.
 - Added vision/re-plan logging and summary metrics, plus fake-client tests for vision modes, image fallback, planner/re-plan flow, screen events, and call counts.
+- Added saved reusable skills with safe extraction/redaction, @skill guidance, usage tracking, and a searchable Skills manager.
