@@ -18,8 +18,9 @@ from engine import (finish_step_states, run_action, run_task,
 
 
 class FakeResponse:
-    def __init__(self, text):
-        self.choices = [type("Choice", (), {"message": type("Message", (), {"content": text})()})()]
+    def __init__(self, text, finish_reason=None):
+        self.choices = [types.SimpleNamespace(
+            message=types.SimpleNamespace(content=text), finish_reason=finish_reason)]
 
 
 class FakeClient:
@@ -38,7 +39,7 @@ class FakeClient:
         result = self.texts.pop(0)
         if isinstance(result, Exception):
             raise result
-        return FakeResponse(result)
+        return result if isinstance(result, FakeResponse) else FakeResponse(result)
 
 
 def plan_reply():
@@ -176,6 +177,124 @@ class ModelProgressTests(unittest.TestCase):
         self.assertEqual(constructed["timeout"], 90)
 
 
+class ModelSelectionSpeedTests(unittest.TestCase):
+    def test_model_presets_parsing_sorting_failure_fallback_and_migration(self):
+        fetched = engine.parse_models_response({"data": [
+            {"id": "zeta"}, {"id": "alpha"}, {"id": "auto"}, {"id": "beta"}, {"name": "ignored"}]})
+        self.assertEqual(fetched, list(engine.MODEL_PRESETS) + ["alpha", "beta", "zeta"])
+
+        class FakeHttpResponse:
+            def read(self):
+                return b'{"data":[{"id":"one"},{"id":"two"}]}'
+            def close(self):
+                self.closed = True
+
+        calls = []
+        response_obj = FakeHttpResponse()
+        options, warning = engine.fetch_model_options(
+            "https://models.example/v1", api_key="secret",
+            urlopen=lambda request, timeout: calls.append((request, timeout)) or response_obj)
+        self.assertEqual(calls[0][0].full_url, "https://models.example/v1/models")
+        self.assertEqual(calls[0][0].get_header("Authorization"), "Bearer secret")
+        self.assertEqual(calls[0][1], 10)
+        self.assertEqual(options, list(engine.MODEL_PRESETS) + ["one", "two"])
+        self.assertEqual(warning, "")
+        fallback, warning = engine.fetch_model_options(
+            "https://models.example/v1", urlopen=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")))
+        self.assertEqual(fallback, list(engine.MODEL_PRESETS))
+        self.assertIn("Could not refresh model list", warning)
+        self.assertEqual(engine.migrate_model_config({"model": "legacy"}), ("legacy", "legacy"))
+        self.assertEqual(engine.migrate_model_config({"text_model": "text", "vision_model": ""}),
+                         ("text", "text"))
+        self.assertEqual(engine.migrate_model_config({"model": "legacy", "text_model": "new-text",
+                                                       "vision_model": "vision"}),
+                         ("new-text", "vision"))
+
+    def test_model_selection_for_off_auto_on_and_empty_vision_fallback(self):
+        text = [{"role": "user", "content": "plain text"}]
+        image = [{"role": "user", "content": [
+            {"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:"}}]}]
+        cases = [
+            ({"vision_mode": "off"}, image, "executor", False, "text"),
+            ({"vision_mode": "auto"}, text, "plan", False, "text"),
+            ({"vision_mode": "auto"}, image, "screen-first plan", False, "vision"),
+            ({"vision_mode": "auto", "_auto_vision_switched": True}, text, "step 2", False, "vision"),
+            ({"vision_mode": "auto", "_auto_vision_switched": True}, text, "re-plan 1", False, "text"),
+            ({"vision_mode": "on"}, text, "plan", False, "text"),
+            ({"vision_mode": "on"}, image, "step 1", False, "vision"),
+            ({"vision_mode": "on"}, image, "screen-first plan (vision)", False, "vision"),
+            ({"vision_mode": "on"}, image, "re-plan 1 (vision)", False, "vision"),
+            ({"vision_mode": "on"}, image, "improve", True, "text"),
+            ({"vision_mode": "on", "vision_model": ""}, image, "step 1", False, "text"),
+        ]
+        for config, messages, purpose, force_text, expected in cases:
+            with self.subTest(config=config, purpose=purpose, expected=expected):
+                settings = {"text_model": "text", "vision_model": "vision", **config}
+                if "vision_model" in config and not config["vision_model"]:
+                    settings["vision_model"] = ""
+                client = FakeClient(["ok"])
+                engine._call_model(client, settings, messages, purpose, force_text=force_text)
+                self.assertEqual(client.calls[0]["model"], expected)
+
+    def test_routed_header_is_logged_and_missing_header_is_harmless(self):
+        class RawResponse:
+            def __init__(self, headers, response_obj):
+                self.headers = headers
+                self.response_obj = response_obj
+            def parse(self):
+                return self.response_obj
+
+        class RawCompletions:
+            def __init__(self, parent, clock, headers):
+                self.parent = parent
+                self.clock = clock
+                self.headers = headers
+            def create(self, **kwargs):
+                self.parent.calls.append(kwargs)
+                self.clock.advance(4.2)
+                return RawResponse(self.headers, FakeResponse("ok"))
+
+        class RawClient:
+            def __init__(self, clock, headers):
+                self.calls = []
+                self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(
+                    with_raw_response=RawCompletions(self, clock, headers)))
+
+        for headers, expected in (({"X-Routed-Via": "edge-model"}, "Model replied in 4.2s via edge-model"),
+                                  ({}, "Model replied in 4.2s")):
+            clock = FakeClock()
+            client = RawClient(clock, headers)
+            events = []
+            engine._call_model(client, {"text_model": "text", "_clock": clock.monotonic},
+                               [], "plan", emit_log=events.append, max_tokens=engine.PLANNER_MAX_TOKENS)
+            self.assertIn(expected, events)
+            self.assertEqual(client.calls[0]["max_tokens"], engine.PLANNER_MAX_TOKENS)
+            if not headers:
+                self.assertFalse(any(" via " in event for event in events))
+
+    def test_history_trimming_keeps_task_plan_skill_files_and_eight_exchanges(self):
+        messages = [{"role": "system", "content": "SYSTEM"},
+                    {"role": "user", "content": "Task: create it\\nPlan: steps\\nSKILL @demo"}]
+        actions = []
+        for index in range(12):
+            messages.append({"role": "assistant", "content": f"assistant-{index}"})
+            messages.append({"role": "user", "content": f"Result: result-{index}"})
+            actions.append({"action": "wait", "label": f"wait {index}", "result": f"ok-{index}"})
+        trimmed = engine.trim_history(messages, actions, "Files known in this task: /workspace/a.py")
+        self.assertIn("SYSTEM", trimmed[0]["content"])
+        self.assertIn("Files known in this task: /workspace/a.py", trimmed[0]["content"])
+        self.assertIn("Task: create it", trimmed[1]["content"])
+        self.assertIn("Plan: steps", trimmed[1]["content"])
+        self.assertIn("SKILL @demo", trimmed[1]["content"])
+        summaries = [message for message in trimmed if "Earlier actions:" in str(message.get("content", ""))]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("wait 0 ok-0", summaries[0]["content"])
+        self.assertNotIn("assistant-3", json.dumps(trimmed))
+        self.assertIn("assistant-4", json.dumps(trimmed))
+        self.assertIn("assistant-11", json.dumps(trimmed))
+        self.assertEqual(sum(message.get("role") == "assistant" for message in trimmed), 8)
+
+
 class ChecklistStateTests(unittest.TestCase):
     def test_in_order_and_skipped_transitions_mark_earlier_steps_done(self):
         states = {1: "pending", 2: "pending", 3: "pending", 4: "pending"}
@@ -237,6 +356,8 @@ class EngineTests(unittest.TestCase):
         plan_event = next(event for event in events if event["type"] == "plan")
         self.assertEqual(plan_event["goal"], "Complete the desktop task")
         self.assertIn("Plan", client.calls[1]["messages"][1]["content"])
+        self.assertEqual(client.calls[0]["max_tokens"], engine.PLANNER_MAX_TOKENS)
+        self.assertTrue(all(call["max_tokens"] == engine.EXECUTOR_MAX_TOKENS for call in client.calls[1:]))
         self.assertEqual([e["step_id"] for e in events if e["type"] == "step_start"], [1, 2])
         self.assertEqual([e["step_id"] for e in events if e["type"] == "step_done"], [1, 2])
         self.assertEqual(len(actions), 2)
@@ -251,6 +372,18 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("Model call timed out" in text and "90s" in text for text in warnings))
         self.assertTrue(any("continuing without a plan" in text for text in warnings))
         self.assertEqual(events[-1]["api_calls"], 2)
+
+    def test_length_limited_reply_warns_and_uses_bad_reply_retry(self):
+        client = FakeClient([plan_reply(), FakeResponse("partial JSON", finish_reason="length"),
+                             response("finish", args={"message": "retried"})])
+        events = self.invoke(client)
+        self.assertTrue(any(event["type"] == "log" and "max_tokens limit" in event.get("text", "")
+                            for event in events))
+        self.assertTrue(any(event["type"] == "warning" and "Bad reply; asking again" in event.get("text", "")
+                            for event in events))
+        self.assertEqual([call["max_tokens"] for call in client.calls], [
+            engine.PLANNER_MAX_TOKENS, engine.EXECUTOR_MAX_TOKENS, engine.EXECUTOR_MAX_TOKENS])
+        self.assertEqual(events[-1]["outcome"], "retried")
 
     def test_unknown_skill_warning_is_emitted_to_task_log(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -418,8 +551,10 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([json.dumps(first_plan), response("finish", 1, {"message": "done"})])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock, patches[1] as dir_mock, patches[2] as save_mock:
-            events = self.invoke(client, settings_extra={"vision_mode": "off"})
+            events = self.invoke(client, settings_extra={"vision_mode": "off", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
         grab_mock.assert_not_called()
+        self.assertTrue(all(call["model"] == "text-model" for call in client.calls))
         dir_mock.assert_not_called()
         save_mock.assert_not_called()
         self.assertFalse(any("image_url" in str(call["messages"]) for call in client.calls))
@@ -430,7 +565,8 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([plan_reply(), json.dumps({"screen": "A blank notepad window.", **json.loads(response("finish", 1))})])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock, patches[1], patches[2] as save_mock:
-            events = self.invoke(client, settings_extra={"vision_mode": "on"})
+            events = self.invoke(client, settings_extra={"vision_mode": "on", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
         self.assertEqual(grab_mock.call_count, 1)
         action_messages = client.calls[1]["messages"]
         self.assertTrue(any(isinstance(message.get("content"), list) and
@@ -438,6 +574,9 @@ class EngineTests(unittest.TestCase):
                             for message in action_messages))
         self.assertEqual(events[-1]["vision_used"], "yes")
         self.assertEqual(events[-1]["total_api_calls"], 2)
+        self.assertEqual([call["model"] for call in client.calls], ["text-model", "vision-model"])
+        self.assertEqual([call["max_tokens"] for call in client.calls],
+                         [engine.PLANNER_MAX_TOKENS, engine.EXECUTOR_MAX_TOKENS])
         self.assertTrue(any(event["type"] == "screen" and "blank notepad" in event["text"] for event in events))
         self.assertTrue(any(event["type"] == "log" and
                             event.get("text") == "Calling model: step 1 (vision)"
@@ -449,8 +588,10 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([plan_reply(), response("finish", 1, {"message": "done"})])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock:
-            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+            events = self.invoke(client, settings_extra={"vision_mode": "auto", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
         grab_mock.assert_not_called()
+        self.assertEqual([call["model"] for call in client.calls], ["text-model", "text-model"])
         self.assertEqual(events[-1]["vision_used"], "no")
 
     def test_auto_planner_needs_vision_enables_and_remains_on(self):
@@ -463,8 +604,14 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([json.dumps(first_plan), json.dumps(first_action), json.dumps(last_action)])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock, patches[1], patches[2]:
-            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+            events = self.invoke(client, settings_extra={"vision_mode": "auto", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
         self.assertEqual(grab_mock.call_count, 2)
+        self.assertEqual([call["model"] for call in client.calls],
+                         ["text-model", "vision-model", "vision-model"])
+        self.assertTrue(any(event["type"] == "log" and
+                            event.get("text") == "Switching to vision model: vision-model"
+                            for event in events))
         self.assertEqual(events[-1]["vision_used"], "turned on at step 1")
         self.assertEqual(events[-1]["total_api_calls"], 3)
         self.assertEqual(len([event for event in events if event["type"] == "screen"]), 2)
@@ -482,8 +629,14 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([json.dumps(first), json.dumps(second), response("finish", 1, {"message": "done"})])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock, patches[1], patches[2] as save_mock:
-            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+            events = self.invoke(client, settings_extra={"vision_mode": "auto", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
         self.assertEqual(grab_mock.call_count, 1)
+        self.assertEqual([call["model"] for call in client.calls],
+                         ["text-model", "vision-model", "text-model"])
+        self.assertEqual([call["max_tokens"] for call in client.calls],
+                         [engine.PLANNER_MAX_TOKENS, engine.PLANNER_MAX_TOKENS,
+                          engine.EXECUTOR_MAX_TOKENS])
         screen_call = client.calls[1]["messages"]
         self.assertTrue(any(isinstance(message.get("content"), list) and
                             any(part.get("type") == "image_url" for part in message["content"])
@@ -547,7 +700,13 @@ class EngineTests(unittest.TestCase):
         client = FakeClient([json.dumps(first_plan), request, remaining, json.dumps(finish)])
         patches = self._vision_test_patches()
         with patches[0] as grab_mock, patches[1], patches[2]:
-            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+            events = self.invoke(client, settings_extra={"vision_mode": "auto", "text_model": "text-model",
+                                                         "vision_model": "vision-model"})
+        self.assertEqual([call["model"] for call in client.calls],
+                         ["text-model", "text-model", "vision-model", "vision-model"])
+        self.assertTrue(any(event["type"] == "log" and
+                            event.get("text") == "Switching to vision model: vision-model"
+                            for event in events))
         self.assertEqual(events[-1]["vision_used"], "turned on at step 1")
         self.assertEqual(events[-1]["replans"], 1)
         self.assertTrue(any(event["type"] == "replan" and "popup" in event["reason"] for event in events))
@@ -593,9 +752,13 @@ class EngineTests(unittest.TestCase):
                              replacement, response("finish", 2, {"message": "done"})])
         events = self.invoke(client, lambda *_: "ok")
         replan_call = client.calls[3]["messages"][-1]["content"]
+        self.assertEqual(client.calls[3]["max_tokens"], engine.PLANNER_MAX_TOKENS)
         request = json.loads(replan_call)
         self.assertEqual([step["id"] for step in request["completed_steps"]], [1])
         self.assertEqual(request["next_step_id"], 2)
+        executor_after_replan = client.calls[4]["messages"]
+        self.assertIn("Plan", executor_after_replan[1]["content"])
+        self.assertIn("Revised second step", executor_after_replan[1]["content"])
         event = next(event for event in events if event["type"] == "replan")
         self.assertTrue(any(item["type"] == "log" and item.get("text") == "Calling model: re-plan 1"
                             for item in events))
@@ -753,6 +916,7 @@ class SkillTests(unittest.TestCase):
                                      {"client": client, "model": "fake", "_emit_log": logs.append})
         self.assertTrue(logs[0].startswith("Calling model: skill extractor"))
         self.assertTrue(logs[-1].startswith("Model replied in "))
+        self.assertEqual(client.calls[0]["max_tokens"], engine.SKILL_EXTRACTOR_MAX_TOKENS)
         self.assertEqual(result["description"], extracted["description"])
         self.assertEqual(result["trace"][0]["args"]["text"], "{content}")
         self.assertEqual(len(client.calls), 1)
@@ -1207,6 +1371,7 @@ class ImprovePromptTests(unittest.TestCase):
         self.assertEqual(result["changes"], "Corrected grammar and clarified the wording.")
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0]["temperature"], 0)
+        self.assertEqual(client.calls[0]["max_tokens"], engine.IMPROVE_MAX_TOKENS)
         self.assertEqual(len(client.calls[0]["messages"]), 2)
         self.assertNotIn("image_url", json.dumps(client.calls[0]["messages"]))
         self.assertIn("same language", client.calls[0]["messages"][0]["content"])
@@ -1274,6 +1439,68 @@ class ReportNotepadTests(unittest.TestCase):
 
 class ScreenshotTests(unittest.TestCase):
     invoke = EngineTests.invoke
+
+    def test_reduced_screenshot_width_preserves_grid_and_click_mapping(self):
+        resized_sizes = []
+        line_calls = []
+
+        class FakeImage:
+            def __init__(self, size):
+                self.size = size
+            def resize(self, size):
+                resized_sizes.append(size)
+                return FakeImage(size)
+            def convert(self, _mode):
+                return self
+            def save(self, buffer, *_args, **_kwargs):
+                buffer.write(b"fake-jpeg")
+            @staticmethod
+            def new(_mode, size, _color):
+                return FakeImage(size)
+            @staticmethod
+            def alpha_composite(image, _overlay):
+                return FakeImage(image.size)
+
+        class Drawer:
+            @staticmethod
+            def line(points, **_kwargs):
+                line_calls.append(points)
+            @staticmethod
+            def text(*_args, **_kwargs):
+                pass
+
+        pil = types.ModuleType("PIL")
+        pil_image = types.ModuleType("PIL.Image")
+        pil_image.new = FakeImage.new
+        pil_image.alpha_composite = FakeImage.alpha_composite
+        pil_draw = types.ModuleType("PIL.ImageDraw")
+        pil_draw.Draw = lambda _image: Drawer()
+        pil_font = types.ModuleType("PIL.ImageFont")
+        pil_font.truetype = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no font"))
+        pil_font.load_default = lambda: object()
+        pil.Image, pil.ImageDraw, pil.ImageFont = pil_image, pil_draw, pil_font
+
+        class FakePyAutoGUI:
+            FAILSAFE = False
+            @staticmethod
+            def size():
+                return 1920, 1080
+            @staticmethod
+            def screenshot():
+                return FakeImage((1920, 1080))
+
+        with patch.dict(sys.modules, {"PIL": pil, "PIL.Image": pil_image,
+                                      "PIL.ImageDraw": pil_draw, "PIL.ImageFont": pil_font}), \
+             patch.object(engine, "_pyautogui", return_value=FakePyAutoGUI):
+            encoded = engine.grab()
+            point = engine.cell_to_xy({"cell": "D3", "dx": 0.2, "dy": 0.7})
+        self.assertEqual(base64.b64decode(encoded), b"fake-jpeg")
+        self.assertEqual(engine.SCREENSHOT_WIDTH, 960)
+        self.assertEqual(resized_sizes, [(960, 540)])
+        self.assertEqual(len(line_calls), engine.COLS + engine.ROWS + 2)
+        self.assertEqual(line_calls[engine.COLS], [(960, 0), (960, 540)])
+        self.assertEqual(line_calls[-1], [(0, 540), (960, 540)])
+        self.assertEqual(point, (384, 324))
 
     def test_task_folder_file_names_and_safe_slug(self):
         now = datetime(2025, 4, 5, 6, 7, 8)

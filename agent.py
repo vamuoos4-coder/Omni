@@ -7,11 +7,12 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
-from engine import (REPORTS_DIR, SCREENSHOTS_DIR, SKILLS_DIR, cleanup_screenshot_folders,
-                    clear_screenshot_folders, delete_skill, extract_skill, improve_prompt,
-                    list_skills, load_skill, migrate_vision_mode, open_report_in_notepad,
-                    redact_skill_secrets, run_task, save_skill, skill_exists, suggest_skill_name,
-                    transition_step_states, finish_step_states, validate_skill_name)
+from engine import (MODEL_PRESETS, REPORTS_DIR, SCREENSHOTS_DIR, SKILLS_DIR,
+                    cleanup_screenshot_folders, clear_screenshot_folders, delete_skill,
+                    extract_skill, fetch_model_options, finish_step_states, improve_prompt,
+                    list_skills, load_skill, migrate_model_config, migrate_vision_mode,
+                    open_report_in_notepad, redact_skill_secrets, run_task, save_skill,
+                    skill_exists, suggest_skill_name, transition_step_states, validate_skill_name)
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -54,7 +55,13 @@ class App:
 
         self.base = self._field("Base URL (e.g. http://localhost:3001/v1)", cfg.get("base", ""))
         self.key = self._field("API key", cfg.get("key", ""), show="*")
-        self.model = self._field("Model name", cfg.get("model", ""))
+        text_model, vision_model = migrate_model_config(cfg)
+        self._model_options = list(MODEL_PRESETS)
+        self._model_refresh_serial = 0
+        self.text_model = self._model_field("Text model", text_model)
+        self.vision_model = self._model_field("Vision model", vision_model)
+        self.refresh_models_btn = ttk.Button(root, text="Refresh models", command=self.refresh_models)
+        self.refresh_models_btn.pack(anchor="e", padx=10, pady=(0, 4))
         self.browser = self._field("Browser for links (blank = Windows default, or: chrome, brave, msedge)",
                                    cfg.get("browser", ""))
         self.vision_mode = tk.StringVar(value=migrate_vision_mode(cfg))
@@ -112,6 +119,8 @@ class App:
 
         self.log = scrolledtext.ScrolledText(root, state="disabled")
         self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        if self.base.get().strip():
+            self.root.after(0, self.refresh_models)
 
     def _field(self, label, value, show=None):
         tk.Label(self.root, text=label).pack(anchor="w", padx=10)
@@ -119,6 +128,53 @@ class App:
         e.insert(0, value)
         e.pack(fill="x", padx=10)
         return e
+
+    def _model_field(self, label, value):
+        tk.Label(self.root, text=label).pack(anchor="w", padx=10)
+        combo = ttk.Combobox(self.root, state="normal", values=self._model_options)
+        combo.set(value)
+        combo.pack(fill="x", padx=10)
+        return combo
+
+    def _apply_model_options(self, options):
+        self._model_options = list(options)
+        values = tuple(self._model_options)
+        self.text_model.configure(values=values)
+        self.vision_model.configure(values=values)
+
+    def refresh_models(self):
+        self._model_refresh_serial += 1
+        serial = self._model_refresh_serial
+        base_url = self.base.get().strip()
+        api_key = self.key.get().strip()
+        self._apply_model_options(MODEL_PRESETS)
+        if not base_url:
+            self.refresh_models_btn.configure(state="normal")
+            self._append(datetime.now().astimezone().isoformat(timespec="seconds"),
+                         "WARNING: Enter a Base URL to refresh models.")
+            return
+        self.refresh_models_btn.configure(state="disabled")
+
+        def worker():
+            options, warning = fetch_model_options(base_url, api_key=api_key)
+            try:
+                self.root.after(0, self._models_loaded, serial, options, warning)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _models_loaded(self, serial, options, warning):
+        if serial != self._model_refresh_serial:
+            return
+        self.refresh_models_btn.configure(state="normal")
+        if warning:
+            # Refresh begins with presets; failed fetches keep those choices available.
+            self._apply_model_options(MODEL_PRESETS)
+            self._append(datetime.now().astimezone().isoformat(timespec="seconds"),
+                         "WARNING: " + warning)
+        else:
+            self._apply_model_options(options)
 
     def _append(self, timestamp, text):
         self.log.configure(state="normal")
@@ -327,7 +383,9 @@ class App:
         if not original.strip() or self._improving:
             return
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
-                    "model": self.model.get().strip(), "_emit_log": self._emit_model_log,
+                    "model": self.text_model.get().strip(), "text_model": self.text_model.get().strip(),
+                    "vision_model": self.vision_model.get().strip() or self.text_model.get().strip(),
+                    "_emit_log": self._emit_model_log,
                     "_emit_timeout": lambda text: self.emit({"type": "warning", "time": "", "text": text})}
         self._improving = True
         self.improve_btn.configure(state="disabled")
@@ -396,7 +454,9 @@ class App:
             return
         self.save_skill_btn.configure(state="disabled")
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
-                    "model": self.model.get().strip(), "_emit_log": self._emit_model_log,
+                    "model": self.text_model.get().strip(), "text_model": self.text_model.get().strip(),
+                    "vision_model": self.vision_model.get().strip() or self.text_model.get().strip(),
+                    "_emit_log": self._emit_model_log,
                     "_emit_timeout": lambda text: self.emit({"type": "warning", "time": "", "text": text})}
 
         def worker():
@@ -638,7 +698,9 @@ class App:
 
     def start(self):
         task = self.task.get("1.0", "end").strip()
-        if not task or not self.model.get().strip():
+        text_model = self.text_model.get().strip()
+        vision_model = self.vision_model.get().strip() or text_model
+        if not task or not text_model:
             self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
             return
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -646,7 +708,8 @@ class App:
         self._append(stamp, "Planning...")
         if self.remember.get():
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
+                json.dump({"base": self.base.get(), "key": self.key.get(), "model": text_model,
+                           "text_model": text_model, "vision_model": vision_model,
                            "browser": self.browser.get().strip(), "vision_mode": self.vision_mode.get(),
                            "batch_actions": self.batch_actions.get(),
                            "open_report_notepad": self.open_report_notepad.get()}, f)
@@ -663,8 +726,11 @@ class App:
         self.plan_rows.clear()
         self.current_steps = []
         self.plan_goal.configure(text="Planning…")
+        if not self.vision_model.get().strip():
+            self.vision_model.set(text_model)
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
-                    "model": self.model.get().strip(), "browser": self.browser.get().strip(),
+                    "model": text_model, "text_model": text_model, "vision_model": vision_model,
+                    "browser": self.browser.get().strip(),
                     "vision_mode": self.vision_mode.get(), "batch_actions": self.batch_actions.get(),
                     "open_report_notepad": self.open_report_notepad.get(),
                     "workspace_dir": HERE, "initial_logs_emitted": True}

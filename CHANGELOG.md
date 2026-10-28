@@ -1,5 +1,7 @@
 # Changelog
 
+- Added editable Text/Vision model selectors with asynchronous `/models` refresh, legacy-config migration, vision-aware routing, token caps, bounded executor history, 960px screenshots, and routed-model timing logs.
+- Expanded fake-only tests for model fetching/routing, token limits, history retention, screenshot mapping, and routed-via logging.
 - Split desktop automation orchestration/actions into `engine.py`; `agent.py` now owns the Tkinter UI and renders timestamped engine events.
 - Added a spelling-tolerant planner with one invalid-plan retry, plan-aware action step IDs, and a live plan checklist.
 - Added end-of-task summaries with goal, completed/total steps, API-call count, elapsed time, and outcome.

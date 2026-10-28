@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -22,6 +23,12 @@ MAX_STEPS = 15
 MAX_STEPS_VISION = 25
 MODEL_TIMEOUT_SECONDS = 90
 MODEL_HEARTBEAT_SECONDS = 5
+EXECUTOR_MAX_TOKENS = 600
+PLANNER_MAX_TOKENS = 800
+SKILL_EXTRACTOR_MAX_TOKENS = 1200
+IMPROVE_MAX_TOKENS = 400
+SCREENSHOT_WIDTH = 960
+MODEL_PRESETS = ("auto", "auto:fast", "auto:smart", "auto:agent-fast", "auto:agent-vision")
 COLS, ROWS = 16, 9
 
 
@@ -589,7 +596,8 @@ def extract_skill(candidate, settings):
         try:
             response = _call_model(client, settings, messages, "skill extractor",
                                    emit_log=settings.get("_emit_log"),
-                                   on_timeout=settings.get("_emit_timeout"))
+                                   on_timeout=settings.get("_emit_timeout"),
+                                   max_tokens=SKILL_EXTRACTOR_MAX_TOKENS, force_text=True)
             value = json.loads(_content(response).strip())
             result = _validate_extraction(value)
             result, _ = redact_skill_secrets(result)
@@ -793,7 +801,7 @@ def grab():
     from PIL import Image, ImageDraw, ImageFont
     shot = pyautogui.screenshot()
     sw, sh = shot.size
-    w = 1280
+    w = SCREENSHOT_WIDTH
     h = int(sh * w / sw)
     img = shot.resize((w, h)).convert("RGBA")
     ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -1188,6 +1196,51 @@ def run_action(action, args, settings=None):
     return f"unknown action: {action}"
 
 
+def migrate_model_config(config):
+    """Migrate legacy model settings to separate text and vision selections."""
+    config = config if isinstance(config, dict) else {}
+    text_model = str(config.get("text_model") or config.get("model") or "auto").strip() or "auto"
+    vision_model = str(config.get("vision_model") or text_model).strip() or text_model
+    return text_model, vision_model
+
+
+def model_options(model_ids=()):
+    """Return fixed preset order followed by unique fetched IDs in alphabetical order."""
+    preset_set = set(MODEL_PRESETS)
+    ids = {str(model_id).strip() for model_id in model_ids
+           if isinstance(model_id, str) and str(model_id).strip() and str(model_id).strip() not in preset_set}
+    return list(MODEL_PRESETS) + sorted(ids, key=lambda model_id: (model_id.casefold(), model_id))
+
+
+def parse_models_response(payload):
+    value = json.loads(payload) if isinstance(payload, (str, bytes, bytearray)) else payload
+    if not isinstance(value, dict) or not isinstance(value.get("data"), list):
+        raise ValueError("models response must contain a data list")
+    return model_options(item.get("id", "") for item in value["data"] if isinstance(item, dict))
+
+
+def fetch_model_options(base_url, api_key="", urlopen=None, timeout=10):
+    """Fetch OpenAI-compatible /models; return presets plus a short warning on failure."""
+    base_url = str(base_url or "").strip().rstrip("/")
+    if not base_url:
+        return list(MODEL_PRESETS), ""
+    opener = urlopen or urllib.request.urlopen
+    try:
+        headers = {"Authorization": "Bearer " + str(api_key).strip()} if str(api_key or "").strip() else {}
+        request = urllib.request.Request(base_url + "/models", headers=headers)
+        response = opener(request, timeout=timeout)
+        try:
+            payload = response.read()
+        finally:
+            close = getattr(response, "close", None)
+            if close:
+                close()
+        return parse_models_response(payload), ""
+    except Exception as exc:
+        detail = " ".join(str(exc).split())[:100] or exc.__class__.__name__
+        return list(MODEL_PRESETS), f"Could not refresh model list: {detail}"
+
+
 def _client_for(settings):
     client = settings.get("client") or settings.get("model_client")
     if client is not None:
@@ -1198,7 +1251,65 @@ def _client_for(settings):
                   timeout=MODEL_TIMEOUT_SECONDS)
 
 
+def _text_model_name(settings):
+    return str(settings.get("text_model") or settings.get("model") or "").strip()
+
+
+def _vision_model_name(settings):
+    return str(settings.get("vision_model") or _text_model_name(settings)).strip() or _text_model_name(settings)
+
+
+def _messages_have_image(messages):
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url" for part in content):
+            return True
+    return False
+
+
+def trim_history(messages, action_history=(), created_files_text="", max_exchanges=8):
+    """Keep system, first task/plan/skill user message, summary, and the last N exchanges."""
+    if not messages:
+        return []
+    first_user_index = next((index for index, message in enumerate(messages)
+                             if index > 0 and message.get("role") == "user"), None)
+    if first_user_index is None:
+        result = [dict(message) for message in messages[:1]]
+        tail = messages[1:]
+    else:
+        result = [dict(messages[0]), dict(messages[first_user_index])]
+        tail = messages[first_user_index + 1:]
+    keep_count = max(1, int(max_exchanges)) * 2
+    trim_at = max(0, len(tail) - keep_count)
+    if trim_at:
+        older_actions = list(action_history[:-max(1, int(max_exchanges))])
+        summary_parts = []
+        for index, item in enumerate(older_actions[:12], 1):
+            label = " ".join(str(item.get("label") or item.get("action", "action")).split())[:60]
+            outcome = " ".join(str(item.get("result", "ok")).split())[:48]
+            summary_parts.append(f"{index}. {label} {outcome}".strip())
+        if len(older_actions) > 12:
+            summary_parts.append("…")
+        summary = "Earlier actions: " + ("; ".join(summary_parts) or "earlier exchanges omitted.")
+        result.append({"role": "user", "content": summary[:1200]})
+    result.extend(dict(message) for message in tail[trim_at:])
+    if created_files_text:
+        system_content = result[0].get("content", "")
+        result[0]["content"] = str(system_content) + "\n\n" + str(created_files_text)
+    return result
+
+
+def _finish_reason(response):
+    try:
+        return response.choices[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
 def _content(response):
+    if _finish_reason(response) == "length":
+        return ""
     return response.choices[0].message.content or ""
 
 
@@ -1208,7 +1319,29 @@ def _is_timeout_error(exc):
     return "timeout" in name or "timed out" in message or "timeout" in message
 
 
-def _call_model(client, settings, messages, purpose, stop_event=None, emit_log=None, on_timeout=None):
+def _model_for_call(settings, messages, purpose="", force_text=False):
+    text_model = _text_model_name(settings)
+    vision_model = _vision_model_name(settings)
+    if force_text:
+        return text_model
+    mode = settings.get("vision_mode")
+    if not isinstance(mode, str) or mode.lower() not in ("off", "auto", "on"):
+        mode = ("on" if settings.get("vision") else "off") if "vision" in settings else "auto"
+    mode = mode.lower()
+    has_image = _messages_have_image(messages)
+    if mode == "off":
+        return text_model
+    if mode == "on":
+        return vision_model if has_image else text_model
+    if purpose.lower().startswith("re-plan") and not has_image:
+        return text_model
+    if has_image or settings.get("_auto_vision_switched"):
+        return vision_model
+    return text_model
+
+
+def _call_model(client, settings, messages, purpose, stop_event=None, emit_log=None, on_timeout=None,
+                max_tokens=EXECUTOR_MAX_TOKENS, force_text=False):
     """Call the model with bounded client timeout, progress logging, and a cancellable heartbeat."""
     settings = settings or {}
     logger = emit_log or settings.get("_emit_log")
@@ -1253,11 +1386,22 @@ def _call_model(client, settings, messages, purpose, stop_event=None, emit_log=N
             # The monitor is advisory; it must never interfere with task execution.
             return
 
+    model_name = _model_for_call(settings, messages, purpose, force_text=force_text)
     monitor = threading.Thread(target=heartbeat_worker, name="model-heartbeat", daemon=True)
     monitor.start()
     try:
-        response = client.chat.completions.create(model=settings.get("model", ""),
-                                                  messages=messages, temperature=0)
+        completions = client.chat.completions
+        raw_completions = getattr(completions, "with_raw_response", None)
+        if raw_completions is not None and hasattr(raw_completions, "create"):
+            raw_response = raw_completions.create(model=model_name, messages=messages,
+                                                  temperature=0, max_tokens=max_tokens)
+            headers = getattr(raw_response, "headers", {}) or {}
+            routed_via = headers.get("X-Routed-Via") or headers.get("x-routed-via")
+            response = raw_response.parse()
+        else:
+            routed_via = None
+            response = completions.create(model=model_name, messages=messages,
+                                          temperature=0, max_tokens=max_tokens)
     except Exception as exc:
         finished.set()
         elapsed = max(0.0, clock() - started)
@@ -1276,7 +1420,12 @@ def _call_model(client, settings, messages, purpose, stop_event=None, emit_log=N
     else:
         finished.set()
         elapsed = max(0.0, clock() - started)
-        log_line(f"Model replied in {elapsed:.1f}s")
+        if _finish_reason(response) == "length":
+            log_line(f"WARNING: Model reply reached the max_tokens limit ({max_tokens}); using the bad-reply retry path.")
+        if routed_via:
+            log_line(f"Model replied in {elapsed:.1f}s via {routed_via}")
+        else:
+            log_line(f"Model replied in {elapsed:.1f}s")
         return response
     finally:
         finished.set()
@@ -1294,7 +1443,8 @@ def improve_prompt(text, settings):
                            [{"role": "system", "content": IMPROVE_SYSTEM},
                             {"role": "user", "content": original}],
                            "improve", emit_log=settings.get("_emit_log"),
-                           on_timeout=settings.get("_emit_timeout"))
+                           on_timeout=settings.get("_emit_timeout"),
+                           max_tokens=IMPROVE_MAX_TOKENS, force_text=True)
     try:
         value = json.loads(_content(response).strip())
     except Exception as exc:
@@ -1406,6 +1556,7 @@ def run_task(task, settings, emit, stop_event):
         # Preserve compatibility for direct engine callers using the old boolean.
         mode = ("on" if settings.get("vision") else "off") if "vision" in settings else "auto"
     mode = mode.lower()
+    settings["_auto_vision_switched"] = False
     vision = mode == "on"
     batching_requested = bool(settings.get("batch_actions", True))
     batching_enabled = batching_requested and not vision
@@ -1462,13 +1613,19 @@ def run_task(task, settings, emit, stop_event):
             created_files.append({"path": full_path, "how": how})
         send("file_saved", path=full_path, how=how)
 
+    def switch_auto_to_vision_model():
+        if mode == "auto" and not settings.get("_auto_vision_switched"):
+            settings["_auto_vision_switched"] = True
+            send("log", text=f"Switching to vision model: {_vision_model_name(settings)}")
+
     settings["_research_state"] = research_state
     settings["_emit_event"] = send
 
-    def call_model(purpose, messages):
+    def call_model(purpose, messages, max_tokens=EXECUTOR_MAX_TOKENS, force_text=False):
         return _call_model(client, settings, messages, purpose, stop_event=stop_event,
                            emit_log=lambda line: send("log", text=line),
-                           on_timeout=lambda warning: send("warning", text=warning))
+                           on_timeout=lambda warning: send("warning", text=warning),
+                           max_tokens=max_tokens, force_text=force_text)
 
     def action_system(use_vision):
         system = _action_system(plan, use_vision, batching_requested and not use_vision, mode)
@@ -1497,6 +1654,7 @@ def run_task(task, settings, emit, stop_event):
         image_model_unavailable = True
         vision = False
         settings["vision"] = False
+        settings["_auto_vision_switched"] = False
         batching_enabled = batching_requested
         send("warning", text="this model cannot read images; pick a vision model or untick vision")
         if exc:
@@ -1557,7 +1715,8 @@ def run_task(task, settings, emit, stop_event):
                 return
             try:
                 api_calls += 1
-                response = call_model("plan" if attempt == 0 else "plan retry", planner_messages)
+                response = call_model("plan" if attempt == 0 else "plan retry", planner_messages,
+                                      max_tokens=PLANNER_MAX_TOKENS, force_text=True)
                 plan = parse_plan(_content(response))
                 break
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1592,7 +1751,8 @@ def run_task(task, settings, emit, stop_event):
                 ]
                 try:
                     api_calls += 1
-                    response = call_model("screen-first plan (vision)", visual_planner_messages)
+                    response = call_model("screen-first plan (vision)", visual_planner_messages,
+                                          max_tokens=PLANNER_MAX_TOKENS)
                     screen_plan = parse_plan(_content(response))
                     plan = screen_plan
                     based_on_screen = True
@@ -1606,6 +1766,7 @@ def run_task(task, settings, emit, stop_event):
         if (mode == "auto" and ((plan and plan["needs_vision"]) or skill_needs_vision)
                 and not image_model_unavailable):
             vision = True
+            switch_auto_to_vision_model()
             vision_enabled_at_step = 1
             vision_reason = ((plan or {}).get("reason") or
                              (f"Skill @{skill_name} requires vision." if skill_needs_vision else "") or
@@ -1638,6 +1799,7 @@ def run_task(task, settings, emit, stop_event):
             if mode != "auto" or vision or image_model_unavailable:
                 return False
             vision = True
+            switch_auto_to_vision_model()
             batching_enabled = False
             vision_enabled_at_step = step_number
             vision_reason = reason or "The task needs on-screen interaction."
@@ -1685,7 +1847,8 @@ def run_task(task, settings, emit, stop_event):
             try:
                 api_calls += 1
                 response = call_model(f"re-plan {replan_count}" + (" (vision)" if vision else ""),
-                                      request_messages)
+                                      request_messages, max_tokens=PLANNER_MAX_TOKENS,
+                                      force_text=not _messages_have_image(request_messages))
                 replan_text = _content(response)
                 if vision:
                     parsed_replan = json.loads(replan_text.strip())
@@ -1713,6 +1876,13 @@ def run_task(task, settings, emit, stop_event):
             consecutive_failures = 0
             send("replan", reason=reason, number=replan_count, goal=plan["goal"],
                  steps=plan["steps"], completed_ids=sorted(done_ids))
+            latest_context = ("Task: " + task + "\n\nPlan (follow these steps; include the current plan step id "
+                              "on every action, including each action in a batch):\n" +
+                              json.dumps(plan, ensure_ascii=False))
+            if skill_guidance:
+                latest_context += "\n\n" + skill_guidance
+            if len(msgs) > 1 and msgs[1].get("role") == "user":
+                msgs[1]["content"] = latest_context
             msgs[0]["content"] = action_system(vision)
             msgs.append({"role": "user", "content":
                          f"Re-plan {replan_count}: {reason}\nUpdated plan: " +
@@ -1732,20 +1902,21 @@ def run_task(task, settings, emit, stop_event):
                 send("warning", text=outcome)
                 loop_ended = True
                 break
-            call_msgs = list(msgs)
+            call_msgs = trim_history(msgs, action_history, files_context(), max_exchanges=8)
             current_screenshot_b64 = None
             if vision:
                 current_screenshot_b64 = capture_screenshot()
-                call_msgs = msgs[:-1] + [{"role": "user", "content": [
-                    {"type": "text", "text": msgs[-1]["content"] + "\n(Latest screenshot with grid attached.)"},
+                latest_content = msgs[-1].get("content", "") if msgs else ""
+                if not isinstance(latest_content, str):
+                    latest_content = "Continue using the task and plan from the conversation."
+                call_msgs.append({"role": "user", "content": [
+                    {"type": "text", "text": latest_content + "\n(Latest screenshot with grid attached.)"},
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + current_screenshot_b64}},
-                ]}]
-            call_msgs[0] = dict(call_msgs[0])
-            call_msgs[0]["content"] += "\n\n" + files_context()
+                ]})
             try:
                 api_calls += 1
                 response = call_model(f"step {action_index}" + (" (vision)" if vision else ""),
-                                      call_msgs)
+                                      call_msgs, max_tokens=EXECUTOR_MAX_TOKENS)
                 text = _content(response)
             except Exception as exc:
                 if vision and _image_unsupported(exc):
@@ -1953,8 +2124,8 @@ def run_task(task, settings, emit, stop_event):
                                           "result": trace_result, "failed": failed})
                 if failed:
                     failed_actions += 1
-                action_history.append({"action": action, "step": step_id, "result": result_text})
-                action_history[:] = action_history[-12:]
+                action_history.append({"action": action, "step": step_id,
+                                       "label": label, "result": result_text})
                 if failed:
                     consecutive_failures += 1
                 else:
