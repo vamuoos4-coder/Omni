@@ -12,3 +12,5 @@
 - Added Notepad report opening with default-app fallback and a saved auto-open preference.
 - Vision screenshots are now saved per task, with click markers, seven-day cleanup, open/clear controls, and live events.
 - Expanded offline tests for prompt improvement, Notepad fallback, screenshot storage, click markers, and cleanup.
+- Added Off/Auto/On vision with legacy-config migration, screen-first planning, Auto escalation, bounded re-planning, and one-line screen memory.
+- Added vision/re-plan logging and summary metrics, plus fake-client tests for vision modes, image fallback, planner/re-plan flow, screen events, and call counts.

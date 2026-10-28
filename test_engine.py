@@ -33,7 +33,10 @@ class FakeClient:
         self.calls.append(kwargs)
         if not self.texts:
             raise AssertionError("Unexpected API call")
-        return FakeResponse(self.texts.pop(0))
+        result = self.texts.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeResponse(result)
 
 
 def plan_reply():
@@ -204,9 +207,257 @@ class EngineTests(unittest.TestCase):
         ran = []
         events = self.invoke(client, lambda action, args, settings: ran.append(action) or "waited")
         self.assertEqual(ran, ["wait"])
-        self.assertTrue(any("finish must be the last action" in e.get("text", "")
+        self.assertTrue(any("finish" in e.get("text", "") and "must be last" in e.get("text", "")
                             for e in events if e["type"] == "warning"))
         self.assertEqual(events[-1]["outcome"], "yes")
+
+    def test_planner_vision_fields_and_config_migration(self):
+        legacy = json.loads(plan_reply())
+        parsed = engine.parse_plan(json.dumps(legacy))
+        self.assertFalse(parsed["needs_vision"])
+        self.assertFalse(parsed["screen_first"])
+        explicit = dict(legacy, needs_vision=True, screen_first=True, reason="A dialog is open.")
+        parsed = engine.parse_plan(json.dumps(explicit))
+        self.assertTrue(parsed["needs_vision"])
+        self.assertTrue(parsed["screen_first"])
+        self.assertEqual(parsed["reason"], "A dialog is open.")
+        self.assertEqual(engine.migrate_vision_mode({"vision": True}), "on")
+        self.assertEqual(engine.migrate_vision_mode({"vision": False}), "auto")
+        self.assertEqual(engine.migrate_vision_mode({}), "auto")
+        self.assertEqual(engine.migrate_vision_mode({"vision": False, "vision_mode": "off"}), "off")
+
+    @staticmethod
+    def _vision_test_patches():
+        from unittest.mock import patch
+        return (patch("engine.grab", return_value=base64.b64encode(b"grid-image").decode("ascii")),
+                patch("engine.create_screenshot_task_dir", return_value="/fake/task"),
+                patch("engine.save_screenshot", side_effect=lambda _image, _folder, step:
+                      f"/fake/task/step-{step:02d}.jpg"))
+
+    def test_vision_off_never_screenshots_or_escalates(self):
+        first_plan = json.loads(plan_reply())
+        first_plan.update(needs_vision=True, screen_first=True, reason="Need a button.")
+        client = FakeClient([json.dumps(first_plan), response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1] as dir_mock, patches[2] as save_mock:
+            events = self.invoke(client, settings_extra={"vision_mode": "off"})
+        grab_mock.assert_not_called()
+        dir_mock.assert_not_called()
+        save_mock.assert_not_called()
+        self.assertFalse(any("image_url" in str(call["messages"]) for call in client.calls))
+        self.assertEqual(events[-1]["vision_used"], "no")
+        self.assertFalse(any(event["type"] == "vision_enabled" for event in events))
+
+    def test_on_always_attaches_screenshot_and_reports_vision(self):
+        client = FakeClient([plan_reply(), json.dumps({"screen": "A blank notepad window.", **json.loads(response("finish", 1))})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2] as save_mock:
+            events = self.invoke(client, settings_extra={"vision_mode": "on"})
+        self.assertEqual(grab_mock.call_count, 1)
+        action_messages = client.calls[1]["messages"]
+        self.assertTrue(any(isinstance(message.get("content"), list) and
+                            any(part.get("type") == "image_url" for part in message["content"])
+                            for message in action_messages))
+        self.assertEqual(events[-1]["vision_used"], "yes")
+        self.assertEqual(events[-1]["total_api_calls"], 2)
+        self.assertTrue(any(event["type"] == "screen" and "blank notepad" in event["text"] for event in events))
+        self.assertIn("one short sentence", client.calls[1]["messages"][0]["content"])
+        self.assertEqual(save_mock.call_args_list[0].args[2], 1)
+
+    def test_auto_stays_text_only_without_planner_or_action_escalation(self):
+        client = FakeClient([plan_reply(), response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock:
+            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+        grab_mock.assert_not_called()
+        self.assertEqual(events[-1]["vision_used"], "no")
+
+    def test_auto_planner_needs_vision_enables_and_remains_on(self):
+        first_plan = json.loads(plan_reply())
+        first_plan.update(needs_vision=True, reason="Read the visible status.")
+        first_action = {"screen": "The app is open.", "thought": "Inspecting.",
+                        "action": "wait", "args": {"seconds": 1}, "step": 1}
+        last_action = {"screen": "The status is visible.", "thought": "Done.",
+                       "action": "finish", "args": {"message": "done"}, "step": 1}
+        client = FakeClient([json.dumps(first_plan), json.dumps(first_action), json.dumps(last_action)])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2]:
+            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+        self.assertEqual(grab_mock.call_count, 2)
+        self.assertEqual(events[-1]["vision_used"], "turned on at step 1")
+        self.assertEqual(events[-1]["total_api_calls"], 3)
+        self.assertEqual(len([event for event in events if event["type"] == "screen"]), 2)
+        enabled = next(event for event in events if event["type"] == "vision_enabled")
+        self.assertEqual(enabled["reason"], "Read the visible status.")
+        for call in client.calls[1:]:
+            self.assertTrue(any(isinstance(message.get("content"), list) for message in call["messages"]))
+
+    def test_screen_first_attaches_image_and_updates_plan(self):
+        first = json.loads(plan_reply())
+        first.update(screen_first=True, reason="A dialog may be present.")
+        second = json.loads(plan_reply())
+        second["goal"] = "Dismiss the visible dialog"
+        second["screen"] = "A confirmation dialog is open."
+        client = FakeClient([json.dumps(first), json.dumps(second), response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2] as save_mock:
+            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+        self.assertEqual(grab_mock.call_count, 1)
+        screen_call = client.calls[1]["messages"]
+        self.assertTrue(any(isinstance(message.get("content"), list) and
+                            any(part.get("type") == "image_url" for part in message["content"])
+                            for message in screen_call))
+        self.assertTrue(any(call.args[2] == 0 for call in save_mock.call_args_list))
+        plan_event = next(event for event in events if event["type"] == "plan")
+        self.assertTrue(plan_event["based_on_screen"])
+        self.assertIn("Based on the current screen", plan_event["note"])
+        self.assertEqual(plan_event["goal"], "Dismiss the visible dialog")
+        self.assertTrue(any(event["type"] == "screen" and "confirmation dialog" in event["text"]
+                            for event in events))
+        self.assertEqual(events[-1]["vision_used"], "yes")
+        self.assertEqual(events[-1]["api_calls"], 3)
+
+    def test_screen_first_off_keeps_first_plan_without_screenshot(self):
+        first = json.loads(plan_reply())
+        first.update(screen_first=True)
+        client = FakeClient([json.dumps(first), response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock:
+            events = self.invoke(client, settings_extra={"vision_mode": "off"})
+        grab_mock.assert_not_called()
+        self.assertEqual(len(client.calls), 2)
+        self.assertFalse(next(event for event in events if event["type"] == "plan")["based_on_screen"])
+
+    def test_screen_first_screenshot_is_saved_as_step_00_jpg(self):
+        first = json.loads(plan_reply())
+        first["screen_first"] = True
+        client = FakeClient([json.dumps(first), plan_reply(), response("finish", 1)])
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("engine.grab", return_value=base64.b64encode(b"grid-image").decode("ascii")), \
+             patch("engine.create_screenshot_task_dir", return_value=folder):
+            self.invoke(client, settings_extra={"vision_mode": "auto"})
+            self.assertTrue(os.path.isfile(os.path.join(folder, "step-00.jpg")))
+
+    def test_screen_first_failed_visual_planner_retains_first_plan_with_warning(self):
+        first = json.loads(plan_reply())
+        first.update(screen_first=True)
+        client = FakeClient([json.dumps(first), RuntimeError("planner unavailable"),
+                             response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0], patches[1], patches[2]:
+            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+        plan_event = next(event for event in events if event["type"] == "plan")
+        self.assertEqual(plan_event["goal"], first["goal"])
+        self.assertFalse(plan_event["based_on_screen"])
+        self.assertTrue(any(event["type"] == "warning" and "keeping the first plan" in event["text"]
+                            for event in events))
+
+    def test_need_vision_escalation_replans_from_a_screenshot(self):
+        first_plan = json.loads(plan_reply())
+        request = response("need_vision", 1, {"reason": "A popup needs a visual check."})
+        remaining = json.dumps({"steps": [{"id": 1, "title": "Handle the popup"},
+                                           {"id": 2, "title": "Verify completion"}],
+                                "screen": "A popup is visible in the foreground."})
+        finish = {"screen": "The popup is gone.", "thought": "Complete.", "action": "finish",
+                  "args": {"message": "done"}, "step": 1}
+        client = FakeClient([json.dumps(first_plan), request, remaining, json.dumps(finish)])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2]:
+            events = self.invoke(client, settings_extra={"vision_mode": "auto"})
+        self.assertEqual(events[-1]["vision_used"], "turned on at step 1")
+        self.assertEqual(events[-1]["replans"], 1)
+        self.assertTrue(any(event["type"] == "replan" and "popup" in event["reason"] for event in events))
+        self.assertTrue(any(event["type"] == "screen" and "foreground" in event["text"] for event in events))
+        self.assertIn("one-sentence `screen` field", client.calls[2]["messages"][0]["content"])
+        self.assertIn("foreground", str(client.calls[3]["messages"]))
+        replan_call = client.calls[2]["messages"][-1]["content"]
+        self.assertTrue(any(part.get("type") == "image_url" for part in replan_call))
+        self.assertGreaterEqual(grab_mock.call_count, 2)
+
+    def test_two_consecutive_failures_escalate_and_replan(self):
+        client = FakeClient([plan_reply(), response("wait", 1), response("wait", 1),
+                             json.dumps({"steps": [{"id": 1, "title": "Recover"}]}),
+                             response("finish", 1, {"message": "recovered"})])
+        results = iter([False, False])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2]:
+            events = self.invoke(client, lambda *_: next(results), settings_extra={"vision_mode": "auto"})
+        self.assertEqual(events[-1]["vision_used"], "turned on at step 2")
+        self.assertEqual(events[-1]["replans"], 1)
+        self.assertTrue(any(event["type"] == "vision_enabled" and "Two actions in a row" in event["reason"]
+                            for event in events))
+        self.assertGreaterEqual(grab_mock.call_count, 2)
+
+    def test_image_unsupported_falls_back_once_with_requested_warning(self):
+        client = FakeClient([plan_reply(), RuntimeError("This model does not support image inputs"),
+                             response("finish", 1, {"message": "done"})])
+        patches = self._vision_test_patches()
+        with patches[0] as grab_mock, patches[1], patches[2]:
+            events = self.invoke(client, settings_extra={"vision_mode": "on"})
+        self.assertEqual(grab_mock.call_count, 1)
+        self.assertTrue(any(event["type"] == "warning" and
+                            "this model cannot read images; pick a vision model or untick vision" == event["text"]
+                            for event in events))
+        self.assertEqual(events[-1]["vision_used"], "yes")
+        self.assertEqual(events[-1]["api_calls"], 3)
+        self.assertFalse(any(isinstance(message.get("content"), list) for message in client.calls[2]["messages"]))
+
+    def test_model_replan_preserves_completed_steps_and_continues_ids(self):
+        replacement = json.dumps({"steps": [{"id": 2, "title": "Revised second step"},
+                                             {"id": 3, "title": "Revised final step"}]})
+        client = FakeClient([plan_reply(), response("wait", 1), response("replan", 2, {"reason": "The route changed."}),
+                             replacement, response("finish", 2, {"message": "done"})])
+        events = self.invoke(client, lambda *_: "ok")
+        replan_call = client.calls[3]["messages"][-1]["content"]
+        request = json.loads(replan_call)
+        self.assertEqual([step["id"] for step in request["completed_steps"]], [1])
+        self.assertEqual(request["next_step_id"], 2)
+        event = next(event for event in events if event["type"] == "replan")
+        self.assertEqual([step["id"] for step in event["steps"]], [1, 2, 3])
+        self.assertEqual(event["completed_ids"], [1])
+        self.assertEqual(events[-1]["replans"], 1)
+        self.assertEqual(events[-1]["api_calls"], 5)
+
+    def test_overloaded_plan_step_automatically_replans_after_seven_actions(self):
+        responses = [plan_reply()] + [response("wait", 1) for _ in range(7)] + [
+            json.dumps({"steps": [{"id": 1, "title": "Continue"}]}), response("finish", 1)]
+        client = FakeClient(responses)
+        events = self.invoke(client, lambda *_: "ok")
+        replan = next(event for event in events if event["type"] == "replan")
+        self.assertIn("more than 6 actions", replan["reason"])
+        self.assertEqual(events[-1]["replans"], 1)
+        self.assertEqual(events[-1]["actions_executed"], 8)
+
+    def test_replanning_stops_after_two_and_warns_once(self):
+        texts = [plan_reply()]
+        for _ in range(3):
+            texts.extend([response("replan", 1, {"reason": "Try a new route."}),
+                          json.dumps({"steps": [{"id": 1, "title": "Remaining"}]})])
+        texts.append(response("finish", 1, {"message": "done"}))
+        client = FakeClient(texts)
+        events = self.invoke(client)
+        self.assertEqual(events[-1]["replans"], 2)
+        warnings = [event for event in events if event["type"] == "warning" and "Maximum of 2 re-plans" in event["text"]]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len([event for event in events if event["type"] == "replan"]), 2)
+
+    def test_vision_screen_memory_is_emitted_but_old_images_are_not_resent(self):
+        first = {"screen": "The editor is empty.", "thought": "Type text.", "action": "wait",
+                 "args": {"seconds": 1}, "step": 1}
+        second = {"screen": "The editor now contains text.", "thought": "Done.", "action": "finish",
+                  "args": {"message": "done"}, "step": 1}
+        client = FakeClient([plan_reply(), json.dumps(first), json.dumps(second)])
+        patches = self._vision_test_patches()
+        with patches[0], patches[1], patches[2]:
+            events = self.invoke(client, settings_extra={"vision_mode": "on"})
+        screens = [event["text"] for event in events if event["type"] == "screen"]
+        self.assertEqual(screens, [first["screen"], second["screen"]])
+        for call in client.calls[1:]:
+            last_user = next(message for message in reversed(call["messages"]) if message["role"] == "user")
+            self.assertIsInstance(last_user["content"], list)
+            self.assertEqual(sum(part.get("type") == "image_url" for part in last_user["content"]), 1)
+        self.assertIn(first["screen"], str(client.calls[2]["messages"]))
+        self.assertEqual(events[-1]["vision_used"], "yes")
 
     def test_vision_forces_one_action_and_informs_model(self):
         client = FakeClient([plan_reply(), batch_response([item("wait", {"seconds": 1}), item("type_text", {"text": "later"})]),
@@ -376,7 +627,7 @@ class WebResearchTests(unittest.TestCase):
         client = FakeClient([plan_reply(), batch_response([item("web_search", {"query": "facts"}), item("wait")]),
                              response("finish", 1, {"message": "done"})])
         events = self.invoke(client)
-        self.assertTrue(any(e["type"] == "warning" and "web_search and read_page must be the last" in e["text"]
+        self.assertTrue(any(e["type"] == "warning" and "web_search" in e["text"] and "must be last" in e["text"]
                             for e in events))
         self.assertFalse(any(e["type"] == "search" for e in events))
 

@@ -8,7 +8,8 @@ from datetime import datetime
 from tkinter import messagebox, scrolledtext
 
 from engine import (REPORTS_DIR, SCREENSHOTS_DIR, cleanup_screenshot_folders,
-                    clear_screenshot_folders, improve_prompt, open_report_in_notepad, run_task)
+                    clear_screenshot_folders, improve_prompt, migrate_vision_mode,
+                    open_report_in_notepad, run_task)
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -47,9 +48,12 @@ class App:
         self.model = self._field("Model name", cfg.get("model", ""))
         self.browser = self._field("Browser for links (blank = Windows default, or: chrome, brave, msedge)",
                                    cfg.get("browser", ""))
-        self.vision = tk.BooleanVar(value=cfg.get("vision", False))
-        tk.Checkbutton(root, text="Use vision (sends a screenshot every step; window minimizes while running)",
-                       variable=self.vision).pack(anchor="w", padx=10)
+        self.vision_mode = tk.StringVar(value=migrate_vision_mode(cfg))
+        vision_row = tk.Frame(root)
+        vision_row.pack(anchor="w", padx=10)
+        tk.Label(vision_row, text="Vision:").pack(side="left")
+        for label, value in (("Off", "off"), ("Auto", "auto"), ("On", "on")):
+            tk.Radiobutton(vision_row, text=label, variable=self.vision_mode, value=value).pack(side="left")
         self.batch_actions = tk.BooleanVar(value=cfg.get("batch_actions", True))
         tk.Checkbutton(root, text="Batch actions (faster, not used with vision)",
                        variable=self.batch_actions).pack(anchor="w", padx=10)
@@ -112,22 +116,39 @@ class App:
         """Queue engine events onto Tk's main thread; engine never touches widgets."""
         self.root.after(0, self._render_event, event)
 
+    def _render_plan_checklist(self, goal, steps, completed_ids=(), note=""):
+        self.current_steps = steps
+        self.plan_goal.configure(text="Goal: " + goal + (" (" + note + ")" if note else ""))
+        for child in self.plan_list.winfo_children():
+            child.destroy()
+        self.plan_rows.clear()
+        completed_ids = set(completed_ids)
+        for step in steps:
+            sid = step.get("id")
+            marker = "✓" if sid in completed_ids else "○"
+            label = tk.Label(self.plan_list, text=f"{marker}  {step.get('title', '')}", anchor="w")
+            label.pack(fill="x")
+            self.plan_rows[sid] = label
+
     def _render_event(self, event):
         kind = event.get("type", "event")
         stamp = event.get("time") or datetime.now().astimezone().isoformat(timespec="seconds")
         if kind == "plan":
-            self.plan_goal.configure(text="Goal: " + event.get("goal", ""))
-            self.current_steps = event.get("steps", [])
-            for child in self.plan_list.winfo_children():
-                child.destroy()
-            self.plan_rows.clear()
-            for step in event.get("steps", []):
-                sid = step.get("id")
-                label = tk.Label(self.plan_list, text=f"○  {step.get('title', '')}", anchor="w")
-                label.pack(fill="x")
-                self.plan_rows[sid] = label
-            self._append(stamp, "Plan created: " + event.get("goal", ""))
+            note = event.get("note", "") if event.get("based_on_screen") else ""
+            self._render_plan_checklist(event.get("goal", ""), event.get("steps", []), note=note)
+            self._append(stamp, "Plan created: " + event.get("goal", "") + (" — " + note if note else ""))
             return
+        if kind == "replan":
+            self._render_plan_checklist(event.get("goal", ""), event.get("steps", []),
+                                        event.get("completed_ids", []))
+            self._append(stamp, f"Re-plan {event.get('number', 0)}: {event.get('reason', '')}")
+        elif kind == "vision_enabled":
+            mode = event.get("mode", "auto")
+            self._append(stamp, f"Vision: ON ({mode}) because: {event.get('reason', '')}")
+            if mode == "auto":
+                self.root.iconify()
+        elif kind == "screen":
+            self._append(stamp, "Screen: " + event.get("text", ""))
         if kind == "step_start":
             self._set_step(event.get("step_id"), "running")
             self._append(stamp, f"Step {event.get('step_id')} started")
@@ -173,6 +194,9 @@ class App:
                          f" | Pages read {event.get('pages_read', 0)}" +
                          f" | Notes saved {event.get('notes_saved', 0)}" +
                          f" | Report {event.get('report_path', '')}" +
+                         f" | Vision {event.get('vision_used', 'no')}" +
+                         f" | Re-plans {event.get('replans', 0)}" +
+                         f" | Total API calls {event.get('total_api_calls', event.get('api_calls', 0))}" +
                          f" | {event.get('seconds', 0)} seconds")
 
     def _set_step(self, step_id, state):
@@ -316,7 +340,7 @@ class App:
         if self.remember.get():
             with open(CONFIG, "w", encoding="utf-8") as f:
                 json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
-                           "browser": self.browser.get().strip(), "vision": self.vision.get(),
+                           "browser": self.browser.get().strip(), "vision_mode": self.vision_mode.get(),
                            "batch_actions": self.batch_actions.get(),
                            "open_report_notepad": self.open_report_notepad.get()}, f)
         elif os.path.exists(CONFIG):
@@ -336,9 +360,9 @@ class App:
         self.plan_goal.configure(text="Planning…")
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
                     "model": self.model.get().strip(), "browser": self.browser.get().strip(),
-                    "vision": self.vision.get(), "batch_actions": self.batch_actions.get(),
+                    "vision_mode": self.vision_mode.get(), "batch_actions": self.batch_actions.get(),
                     "open_report_notepad": self.open_report_notepad.get()}
-        if settings["vision"]:
+        if settings["vision_mode"] == "on":
             self.root.iconify()
         threading.Thread(target=self._run, args=(task, settings), daemon=True).start()
 

@@ -52,6 +52,7 @@ Actions:
 - web_search    args: {"query": "..."}             returns up to 5 titles, URLs and snippets
 - read_page     args: {"url": "https://..."}       reads safe public web pages (about 6000 chars)
 - save_note     args: {"text": "finding", "source": "url"} stores a sourced finding for this task
+- replan        args: {"reason": "why the remaining plan no longer fits"}
 - wait          args: {"seconds": 2}
 - finish        args: {"message": "what was done"}
 
@@ -77,9 +78,17 @@ add a wait solely for app startup. `finish` may only be the last action. `web_se
 `read_page` must be the LAST action in a batch, so their results are available before your next decision.
 Maximum four actions."""
 
+NEED_VISION_ADDON = """
+
+If direct actions cannot reach the needed screen control, you may return
+{"thought":"...","action":"need_vision","args":{"reason":"..."},"step":<plan step id>} to request vision.
+"""
+
 VISION_ADDON = """
 
 VISION IS ON. Each turn you get a screenshot of the whole screen with a red grid.
+For every reply, also include "screen": "one short sentence describing what is on screen now".
+Keep each screen sentence concise; it remains in the conversation as screen memory.
 Columns are letters A-P (left to right), rows are numbers 1-9 (top to bottom); each cell
 is labeled in its top-left corner, e.g. "F5".
 Extra actions:
@@ -93,9 +102,14 @@ over clicking when they can do the job. To click a small target, pick the cell t
 contains its centre and set dx/dy precisely."""
 
 PLANNER_SYSTEM = """You are a task planner for a Windows desktop automation agent. Infer intended meaning and correct spelling mistakes in the goal. Return ONLY valid JSON, with no markdown or other text, in exactly this shape:
-{"goal":"...","steps":[{"id":1,"title":"..."}]}
-Make 3 to 8 short, actionable steps. Use consecutive integer ids starting at 1. For research tasks,
-plan the steps in this order: search, read the best sources, take notes with source URLs, write the report."""
+{"goal":"...","steps":[{"id":1,"title":"..."}],"needs_vision":false,"screen_first":false,"reason":"one short sentence"}
+Make 3 to 8 short, actionable steps. Use consecutive integer ids starting at 1.
+Set needs_vision true when the task needs seeing or interacting with something direct actions cannot reach: buttons, menus or links inside apps/pages, selecting items, reading screen text, checking visual state, or filling forms. Set it false when open_app, type_text, press_key, open_url, youtube_search, open_path, play_song, or research tools can do the job.
+Set screen_first true when the plan depends on what is currently on screen, such as closing a popup or clicking a button in an already-open window. Give a short reason for the vision decision. For research tasks, plan search, read the best sources, take notes with source URLs, then write the report."""
+
+REPLAN_SYSTEM = """You revise an automation plan after reality changed. Return ONLY valid JSON containing ONLY the remaining steps:
+{"steps":[{"id":2,"title":"..."}]}
+Keep completed steps out of the returned list. Continue integer ids after the highest completed step id. Provide actionable short steps."""
 
 IMPROVE_SYSTEM = """Fix spelling and grammar and make the wording clearer. Keep the exact meaning and the same language. Never add actions, steps, facts, or requirements the user did not ask for. Return ONLY valid JSON, with no markdown or extra text, in exactly this shape:
 {"improved":"...","changes":"one short sentence"}"""
@@ -138,7 +152,61 @@ def parse_plan(text):
             raise ValueError("plan step ids must be unique")
         ids.add(step_id)
         normalized.append({"id": step_id, "title": title.strip()})
-    return {"goal": value["goal"].strip(), "steps": normalized}
+    reason = value.get("reason", "")
+    screen = value.get("screen", "")
+    return {"goal": value["goal"].strip(), "steps": normalized,
+            "needs_vision": value.get("needs_vision") is True,
+            "screen_first": value.get("screen_first") is True,
+            "reason": reason.strip() if isinstance(reason, str) else "",
+            "screen": screen.strip() if isinstance(screen, str) else ""}
+
+
+def migrate_vision_mode(config):
+    """Read the new selector or migrate the legacy vision boolean."""
+    mode = config.get("vision_mode")
+    if isinstance(mode, str) and mode.lower() in ("off", "auto", "on"):
+        return mode.lower()
+    legacy = config.get("vision")
+    if isinstance(legacy, bool):
+        return "on" if legacy else "auto"
+    return "auto"
+
+
+def _parse_remaining_steps(text, first_id):
+    value = json.loads(text.strip())
+    steps = value.get("steps") if isinstance(value, dict) else None
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("replan must return at least one remaining step")
+    if len(steps) > 8:
+        raise ValueError("replan returned too many steps")
+    normalized = []
+    for offset, step in enumerate(steps):
+        if not isinstance(step, dict) or not isinstance(step.get("title"), str) or not step["title"].strip():
+            raise ValueError("replan step needs a title")
+        step_id = step.get("id", first_id + offset)
+        if isinstance(step_id, bool) or not isinstance(step_id, int) or step_id != first_id + offset:
+            raise ValueError("replan step ids must continue after completed steps")
+        normalized.append({"id": step_id, "title": step["title"].strip()})
+    return normalized
+
+
+def _image_unsupported(exc):
+    message = str(exc).lower()
+    if not any(word in message for word in ("image", "vision", "multimodal", "visual")):
+        return False
+    return any(word in message for word in ("not support", "unsupported", "does not accept", "cannot accept",
+                                             "can't accept", "invalid image", "no image input"))
+
+
+def _action_system(plan, vision, batch_enabled, vision_mode):
+    system = SYSTEM if plan else SYSTEM.replace(', "step": <plan step id>', "")
+    if vision:
+        system += VISION_ADDON
+    else:
+        system += NEED_VISION_ADDON
+    if batch_enabled and not vision:
+        system += BATCH_ADDON
+    return system
 
 
 def fix_app_name(name):
@@ -741,7 +809,7 @@ def _parse_action_reply(data):
 
 
 def run_task(task, settings, emit, stop_event):
-    """Run planning and action loop. ``settings`` may inject client/action_runner for tests."""
+    """Run planning, actions, optional vision escalation, and limited re-planning."""
     settings = dict(settings or {})
     started = time.monotonic()
     api_calls = 0
@@ -750,10 +818,29 @@ def run_task(task, settings, emit, stop_event):
     completed = set()
     active_id = None
     outcome = "Task ended."
-    calls_limit = MAX_STEPS_VISION if settings.get("vision", False) else MAX_STEPS
     sleep = settings.get("sleep", time.sleep)
-    vision = bool(settings.get("vision", False))
-    batching_enabled = bool(settings.get("batch_actions", True)) and not vision
+    mode = settings.get("vision_mode")
+    if not isinstance(mode, str) or mode.lower() not in ("off", "auto", "on"):
+        # Preserve compatibility for direct engine callers using the old boolean.
+        mode = ("on" if settings.get("vision") else "off") if "vision" in settings else "auto"
+    mode = mode.lower()
+    vision = mode == "on"
+    batching_requested = bool(settings.get("batch_actions", True))
+    batching_enabled = batching_requested and not vision
+    vision_used_ever = False
+    vision_enabled_at_step = None
+    vision_reason = ""
+    image_model_unavailable = False
+    screenshot_task_dir = None
+    screenshot_sequence = 0
+    research_state = {"searches": 0, "pages_read": 0, "notes": [],
+                      "research_started": False, "answer": ""}
+    report_path = ""
+    consecutive_failures = 0
+    step_action_counts = {}
+    action_history = []
+    replan_count = 0
+    replan_limit_warned = False
 
     def send(kind, **data):
         event = {"type": kind, "time": _now()}
@@ -763,11 +850,39 @@ def run_task(task, settings, emit, stop_event):
         except Exception:
             pass
 
-    settings["_research_state"] = research_state = {"searches": 0, "pages_read": 0, "notes": [],
-                      "research_started": False, "answer": ""}
+    settings["_research_state"] = research_state
     settings["_emit_event"] = send
-    report_path = ""
-    screenshot_task_dir = None
+
+    def action_system(use_vision):
+        return _action_system(plan, use_vision, batching_requested and not use_vision, mode)
+
+    def capture_screenshot(special_step=None):
+        nonlocal screenshot_task_dir, screenshot_sequence, vision_used_ever
+        image = grab()
+        vision_used_ever = True
+        if special_step is None:
+            screenshot_sequence += 1
+            number = screenshot_sequence
+        else:
+            number = special_step
+        try:
+            if screenshot_task_dir is None:
+                screenshot_task_dir = create_screenshot_task_dir(task)
+            path = save_screenshot(image, screenshot_task_dir, number)
+            send("screenshot_saved", file_path=path)
+        except Exception as exc:
+            send("warning", text=f"Could not save screenshot: {' '.join(str(exc).split())[:120]}")
+        return image
+
+    def mark_image_model_unavailable(exc=None):
+        nonlocal vision, batching_enabled, image_model_unavailable
+        image_model_unavailable = True
+        vision = False
+        settings["vision"] = False
+        batching_enabled = batching_requested
+        send("warning", text="this model cannot read images; pick a vision model or untick vision")
+        if exc:
+            send("warning", text=f"Image-model detail: {' '.join(str(exc).split())[:120]}")
 
     def complete_step(step_id):
         if step_id is not None and step_id not in completed:
@@ -792,6 +907,10 @@ def run_task(task, settings, emit, stop_event):
 
     try:
         send("thought", text=f"Starting task: {task}")
+        if mode == "on":
+            vision_used_ever = True
+            vision_reason = "Vision mode is set to On."
+            send("vision_enabled", mode="on", reason=vision_reason)
         if stop_event.is_set():
             outcome = "Stopped before planning."
             return
@@ -802,18 +921,16 @@ def run_task(task, settings, emit, stop_event):
             outcome = "Could not initialize the model client."
             return
 
-        # Plan once, retry once only for invalid planner JSON/schema.
+        planner_messages = [{"role": "system", "content": PLANNER_SYSTEM},
+                            {"role": "user", "content": "Task: " + task}]
         for attempt in range(2):
             if stop_event.is_set():
                 outcome = "Stopped during planning."
                 return
             try:
                 api_calls += 1
-                response = client.chat.completions.create(
-                    model=settings.get("model", ""),
-                    messages=[{"role": "system", "content": PLANNER_SYSTEM},
-                              {"role": "user", "content": "Task: " + task}],
-                    temperature=0)
+                response = client.chat.completions.create(model=settings.get("model", ""),
+                                                          messages=planner_messages, temperature=0)
                 plan = parse_plan(_content(response))
                 break
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -827,26 +944,155 @@ def run_task(task, settings, emit, stop_event):
                 plan = None
                 break
 
+        based_on_screen = False
+        if plan and plan.get("screen"):
+            send("screen", text=" ".join(plan["screen"].split())[:300])
+        if plan and plan["screen_first"] and mode != "off":
+            try:
+                planner_image = capture_screenshot(special_step=0)
+            except Exception as exc:
+                planner_image = None
+                send("warning", text=f"Could not capture the current screen for planning: {' '.join(str(exc).split())[:120]}")
+            if planner_image:
+                visual_planner_messages = [
+                    {"role": "system", "content": PLANNER_SYSTEM +
+                     "\nThis is the current screen; base the plan on what is visibly present. Include a one-sentence `screen` field describing it."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Task: " + task + "\nFirst plan: " +
+                         json.dumps(plan, ensure_ascii=False) + "\nReturn the corrected plan based on the current screen."},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + planner_image}},
+                    ]},
+                ]
+                try:
+                    api_calls += 1
+                    response = client.chat.completions.create(model=settings.get("model", ""),
+                                                              messages=visual_planner_messages, temperature=0)
+                    screen_plan = parse_plan(_content(response))
+                    plan = screen_plan
+                    based_on_screen = True
+                    if screen_plan.get("screen"):
+                        send("screen", text=" ".join(screen_plan["screen"].split())[:300])
+                except Exception as exc:
+                    if _image_unsupported(exc):
+                        mark_image_model_unavailable(exc)
+                    send("warning", text=f"Screen-first planning failed; keeping the first plan: {' '.join(str(exc).split())[:140]}")
+
+        if mode == "auto" and plan and plan["needs_vision"] and not image_model_unavailable:
+            vision = True
+            vision_enabled_at_step = 1
+            vision_reason = plan["reason"] or "The plan requires on-screen interaction."
+            vision_used_ever = True
+            settings["vision"] = True
+            send("vision_enabled", mode="auto", reason=vision_reason, step=1)
+            sleep(0.8)
+        elif mode == "on" and not image_model_unavailable:
+            vision = True
+            settings["vision"] = True
+
         if plan:
-            send("plan", goal=plan["goal"], steps=plan["steps"])
-            system = SYSTEM + (VISION_ADDON if vision else "")
+            send("plan", goal=plan["goal"], steps=plan["steps"],
+                 based_on_screen=based_on_screen,
+                 note="Based on the current screen." if based_on_screen else "")
             user_context = ("Task: " + task + "\n\nPlan (follow these steps; include the current plan step id "
                             "on every action, including each action in a batch):\n" +
                             json.dumps(plan, ensure_ascii=False))
         else:
-            system = SYSTEM.replace(', "step": <plan step id>', "")
-            if vision:
-                system += VISION_ADDON
             user_context = "Task: " + task
-        if batching_enabled:
-            system += BATCH_ADDON
+        msgs = [{"role": "system", "content": action_system(vision)},
+                {"role": "user", "content": user_context}]
+        settings["vision"] = vision
 
-        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user_context}]
-        if vision:
+        def enable_auto_vision(reason, step_number):
+            nonlocal vision, batching_enabled, vision_enabled_at_step, vision_reason, vision_used_ever
+            if mode != "auto" or vision or image_model_unavailable:
+                return False
+            vision = True
+            batching_enabled = False
+            vision_enabled_at_step = step_number
+            vision_reason = reason or "The task needs on-screen interaction."
+            vision_used_ever = True
+            settings["vision"] = True
+            msgs[0]["content"] = action_system(True)
+            msgs.append({"role": "user", "content":
+                         "Vision is now enabled because: " + vision_reason + ". Use one action per turn and inspect the latest screen."})
+            send("vision_enabled", mode="auto", reason=vision_reason, step=step_number)
             sleep(0.8)
+            return True
+
+        def request_replan(reason):
+            nonlocal plan, active_id, api_calls, replan_count, replan_limit_warned
+            nonlocal step_action_counts, consecutive_failures
+            if replan_count >= 2:
+                if not replan_limit_warned:
+                    send("warning", text="Maximum of 2 re-plans reached; continuing with the current plan.")
+                    replan_limit_warned = True
+                return False
+            replan_count += 1
+            done_steps = [step for step in (plan or {}).get("steps", []) if step["id"] in completed]
+            last_completed = max(completed, default=0)
+            context = {"task": task, "old_plan": plan or {}, "completed_steps": done_steps,
+                       "last_action_results": action_history[-6:], "reason": reason,
+                       "next_step_id": last_completed + 1}
+            replan_system = REPLAN_SYSTEM + (
+                " Include a one-sentence `screen` field describing the attached screenshot."
+                if vision else "")
+            request_messages = [{"role": "system", "content": replan_system},
+                                {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
+            if vision:
+                try:
+                    planner_image = capture_screenshot()
+                    request_messages[-1] = {"role": "user", "content": [
+                        {"type": "text", "text": json.dumps(context, ensure_ascii=False) +
+                         "\nRe-plan from the current screen."},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + planner_image}},
+                    ]}
+                except Exception as exc:
+                    send("warning", text=f"Could not capture a screen for re-planning: {' '.join(str(exc).split())[:120]}")
+            try:
+                api_calls += 1
+                response = client.chat.completions.create(model=settings.get("model", ""),
+                                                          messages=request_messages, temperature=0)
+                replan_text = _content(response)
+                if vision:
+                    parsed_replan = json.loads(replan_text.strip())
+                    screen_text = parsed_replan.get("screen", "") if isinstance(parsed_replan, dict) else ""
+                    if isinstance(screen_text, str) and screen_text.strip():
+                        screen_text = " ".join(screen_text.split())[:300]
+                        send("screen", text=screen_text, replan=replan_count)
+                        msgs.append({"role": "assistant", "content": replan_text})
+                remaining = _parse_remaining_steps(replan_text, last_completed + 1)
+            except Exception as exc:
+                if vision and _image_unsupported(exc):
+                    mark_image_model_unavailable(exc)
+                    msgs[0]["content"] = action_system(False)
+                    msgs.append({"role": "user", "content":
+                                 "This model cannot read images; continue without visual input."})
+                send("warning", text=f"Re-planning failed; keeping the current plan: {' '.join(str(exc).split())[:140]}")
+                return False
+            done_ids = {step["id"] for step in done_steps}
+            plan_steps = done_steps + remaining
+            plan = {"goal": (plan or {}).get("goal", task), "steps": plan_steps,
+                    "needs_vision": vision, "screen_first": False, "reason": ""}
+            active_id = None
+            step_action_counts = {step_id: count for step_id, count in step_action_counts.items()
+                                  if step_id in done_ids}
+            consecutive_failures = 0
+            send("replan", reason=reason, number=replan_count, goal=plan["goal"],
+                 steps=plan["steps"], completed_ids=sorted(done_ids))
+            msgs[0]["content"] = action_system(vision)
+            msgs.append({"role": "user", "content":
+                         f"Re-plan {replan_count}: {reason}\nUpdated plan: " +
+                         json.dumps(plan, ensure_ascii=False)})
+            return True
 
         loop_ended = False
-        for action_index in range(1, calls_limit + 1):
+        for action_index in range(1, MAX_STEPS_VISION + 1):
+            calls_limit = MAX_STEPS_VISION if vision else MAX_STEPS
+            if action_index > calls_limit:
+                outcome = "Reached the step limit."
+                send("warning", text=outcome)
+                loop_ended = True
+                break
             if stop_event.is_set():
                 outcome = "Stopped by user."
                 send("warning", text=outcome)
@@ -855,18 +1101,10 @@ def run_task(task, settings, emit, stop_event):
             call_msgs = msgs
             current_screenshot_b64 = None
             if vision:
-                b64 = grab()
-                current_screenshot_b64 = b64
-                try:
-                    if screenshot_task_dir is None:
-                        screenshot_task_dir = create_screenshot_task_dir(task)
-                    screenshot_path = save_screenshot(b64, screenshot_task_dir, action_index)
-                    send("screenshot_saved", file_path=screenshot_path)
-                except Exception as exc:
-                    send("warning", text=f"Could not save screenshot: {' '.join(str(exc).split())[:120]}")
+                current_screenshot_b64 = capture_screenshot()
                 call_msgs = msgs[:-1] + [{"role": "user", "content": [
                     {"type": "text", "text": msgs[-1]["content"] + "\n(Latest screenshot with grid attached.)"},
-                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + current_screenshot_b64}},
                 ]}]
             try:
                 api_calls += 1
@@ -874,14 +1112,28 @@ def run_task(task, settings, emit, stop_event):
                                                           messages=call_msgs, temperature=0)
                 text = _content(response)
             except Exception as exc:
-                hint = " (this model may not accept images - untick vision)" if vision else ""
-                send("error", text=f"API ERROR: {exc}{hint}")
+                if vision and _image_unsupported(exc):
+                    mark_image_model_unavailable(exc)
+                    msgs[0]["content"] = action_system(False)
+                    msgs.append({"role": "user", "content":
+                                 "This model cannot read images; continue without visual input."})
+                    # Continue once in text mode; no vision retry loop is possible.
+                    continue
+                send("error", text=f"API ERROR: {exc}")
                 outcome = "Stopped after an API error."
                 loop_ended = True
                 break
             msgs.append({"role": "assistant", "content": text})
             try:
                 data = parse_json(text)
+            except Exception:
+                send("warning", text=f"[{action_index}] Bad reply; asking again.")
+                msgs.append({"role": "user", "content": "Invalid. Reply with ONLY the JSON object."})
+                continue
+
+            if vision and isinstance(data.get("screen"), str) and data["screen"].strip():
+                send("screen", text=" ".join(data["screen"].split())[:300], step=action_index)
+            try:
                 actions, is_batch = _parse_action_reply(data)
             except Exception:
                 send("warning", text=f"[{action_index}] Bad reply; asking again.")
@@ -898,15 +1150,11 @@ def run_task(task, settings, emit, stop_event):
                 send("warning", text="Batch actions are disabled; running only the first action.")
                 actions = actions[:1]
 
-            # A finish action can only terminate the executed batch.
-            if any(item["action"] == "finish" for item in actions[:-1]):
-                send("warning", text="Invalid batch: finish must be the last action; asking again.")
-                msgs.append({"role": "user", "content": "Invalid batch. The finish action may only be last."})
-                continue
-            if any(item["action"] in ("web_search", "read_page") for item in actions[:-1]):
-                send("warning", text="Invalid batch: web_search and read_page must be the last action; asking again.")
+            if any(item["action"] in ("finish", "web_search", "read_page", "replan", "need_vision")
+                   for item in actions[:-1]):
+                send("warning", text="Invalid batch: finish, replan, need_vision, web_search and read_page must be last; asking again.")
                 msgs.append({"role": "user", "content":
-                             "Invalid batch. web_search and read_page must be last so their results can guide the next decision."})
+                             "Invalid batch. finish/replan/need_vision/web_search/read_page must be last."})
                 continue
 
             send("thought", text=str(data.get("thought", "")))
@@ -917,6 +1165,7 @@ def run_task(task, settings, emit, stop_event):
             failed_in_batch = False
             finished_task = False
             emergency_stop = False
+            pending_replan_reason = ""
             for index, item in enumerate(actions):
                 action, args = item["action"], item["args"]
                 if stop_event.is_set():
@@ -935,7 +1184,7 @@ def run_task(task, settings, emit, stop_event):
                         and action in ("click", "double_click", "right_click")):
                     try:
                         marker_path = save_click_marker(current_screenshot_b64, screenshot_task_dir,
-                                                        action_index, args)
+                                                        screenshot_sequence, args)
                         if marker_path:
                             send("screenshot_saved", file_path=marker_path)
                     except Exception as exc:
@@ -944,6 +1193,7 @@ def run_task(task, settings, emit, stop_event):
                 send("action", action=action, args=args, step_id=step_id)
                 actions_executed += 1
                 label = _action_label(action, args)
+
                 if action == "finish":
                     message = str(args.get("message", ""))
                     result = "Done: " + message
@@ -956,6 +1206,48 @@ def run_task(task, settings, emit, stop_event):
                     research_state["answer"] = message
                     combined.append(f"{index + 1}. {label}: OK ({result})")
                     finished_task = True
+                    break
+
+                if action == "replan":
+                    pending_replan_reason = str(args.get("reason", "The model requested a new plan.")).strip()
+                    if not pending_replan_reason:
+                        pending_replan_reason = "The model requested a new plan."
+                    result_text = "Re-planning requested: " + pending_replan_reason
+                    send("result", text=result_text, step_id=step_id)
+                    single_result_text = result_text
+                    combined.append(f"{index + 1}. {label}: OK ({result_text})")
+                    for rest_index in range(index + 1, len(actions)):
+                        rest = actions[rest_index]
+                        combined.append(f"{rest_index + 1}. {_action_label(rest['action'], rest['args'])}: NOT RUN")
+                        send("action", action=rest["action"], args=rest["args"], step_id=rest.get("step"), skipped=True)
+                        send("result", text="NOT RUN", step_id=rest.get("step"), skipped=True)
+                    break
+
+                if action == "need_vision":
+                    requested_reason = str(args.get("reason", "The current task needs on-screen interaction.")).strip()
+                    if not requested_reason:
+                        requested_reason = "The current task needs on-screen interaction."
+                    if mode == "off":
+                        result_text = "Vision is off. Select Auto or On to allow screen interaction."
+                        send("warning", text=result_text)
+                    elif vision:
+                        result_text = "Vision is already on; continue with a normal action."
+                    elif image_model_unavailable:
+                        result_text = "This model cannot read images; pick a vision model or untick vision."
+                        send("warning", text=result_text)
+                    elif enable_auto_vision(requested_reason, action_index):
+                        pending_replan_reason = "Vision was switched on mid-task: " + requested_reason
+                        result_text = "Vision enabled. Re-planning from the current screen."
+                    else:
+                        result_text = "Vision could not be enabled; continue with direct actions."
+                    send("result", text=result_text, step_id=step_id)
+                    single_result_text = result_text
+                    combined.append(f"{index + 1}. {label}: OK ({result_text})")
+                    for rest_index in range(index + 1, len(actions)):
+                        rest = actions[rest_index]
+                        combined.append(f"{rest_index + 1}. {_action_label(rest['action'], rest['args'])}: NOT RUN")
+                        send("action", action=rest["action"], args=rest["args"], step_id=rest.get("step"), skipped=True)
+                        send("result", text="NOT RUN", step_id=rest.get("step"), skipped=True)
                     break
 
                 try:
@@ -981,13 +1273,22 @@ def run_task(task, settings, emit, stop_event):
                 result_text = str(result)
                 single_result_text = result_text
                 send("result", text=result_text, step_id=step_id)
+                action_history.append({"action": action, "step": step_id, "result": result_text})
+                action_history[:] = action_history[-12:]
+                if failed:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+                if plan and step_id is not None:
+                    step_action_counts[step_id] = step_action_counts.get(step_id, 0) + 1
+                    if step_action_counts[step_id] > 6 and not pending_replan_reason:
+                        pending_replan_reason = f"Plan step {step_id} used more than 6 actions."
                 if failed:
                     combined.append(f"{index + 1}. {label}: FAILED ({result_text})")
                     failed_in_batch = True
                     for rest_index in range(index + 1, len(actions)):
                         rest = actions[rest_index]
-                        rest_label = _action_label(rest["action"], rest["args"])
-                        combined.append(f"{rest_index + 1}. {rest_label}: NOT RUN")
+                        combined.append(f"{rest_index + 1}. {_action_label(rest['action'], rest['args'])}: NOT RUN")
                         send("action", action=rest["action"], args=rest["args"],
                              step_id=rest.get("step"), skipped=True)
                         send("result", text="NOT RUN", step_id=rest.get("step"), skipped=True)
@@ -996,8 +1297,21 @@ def run_task(task, settings, emit, stop_event):
                 if emergency_stop:
                     failed_in_batch = True
                     break
+                if pending_replan_reason:
+                    for rest_index in range(index + 1, len(actions)):
+                        rest = actions[rest_index]
+                        combined.append(f"{rest_index + 1}. {_action_label(rest['action'], rest['args'])}: NOT RUN")
+                        send("action", action=rest["action"], args=rest["args"],
+                             step_id=rest.get("step"), skipped=True)
+                        send("result", text="NOT RUN", step_id=rest.get("step"), skipped=True)
+                    break
 
-            # Send exactly one combined result turn to the model for a batch response.
+            if consecutive_failures >= 2:
+                if mode == "auto" and not vision and not image_model_unavailable:
+                    if enable_auto_vision("Two actions in a row failed.", action_index):
+                        pending_replan_reason = pending_replan_reason or "Vision was switched on after two consecutive failures."
+                pending_replan_reason = pending_replan_reason or "Two actions in a row failed."
+
             if vision and is_batch and requested_count > 1:
                 feedback = "Vision mode: one action per turn.\n" + "\n".join(combined)
             elif is_batch:
@@ -1021,11 +1335,10 @@ def run_task(task, settings, emit, stop_event):
             if finished_task:
                 loop_ended = True
                 break
-            # A failed batch stops at that action; the next model turn receives the failure.
-            if failed_in_batch:
-                pass
+            if pending_replan_reason:
+                request_replan(pending_replan_reason)
             sleep(1.2)
-        if not loop_ended:
+        if not loop_ended and outcome == "Task ended.":
             outcome = "Reached the step limit."
             send("warning", text=outcome)
     except Exception as exc:
@@ -1047,11 +1360,16 @@ def run_task(task, settings, emit, stop_event):
                 send("warning", text=f"Could not save research report: {' '.join(str(exc).split())[:160]}")
         total = len(plan["steps"]) if plan else 0
         estimated_saved = actions_executed - api_calls
+        if vision_enabled_at_step is not None:
+            vision_summary = f"turned on at step {vision_enabled_at_step}"
+        else:
+            vision_summary = "yes" if vision_used_ever else "no"
         send("summary", goal=plan["goal"] if plan else task,
              steps_completed=len(completed), steps_total=total,
              actions_executed=actions_executed,
-             api_calls=api_calls, estimated_calls_saved=estimated_saved,
+             api_calls=api_calls, total_api_calls=api_calls, estimated_calls_saved=estimated_saved,
              searches=research_state["searches"], pages_read=research_state["pages_read"],
              notes_saved=len(research_state["notes"]), report_path=report_path,
+             vision_used=vision_summary, replans=replan_count,
              seconds=round(time.monotonic() - started, 2),
              outcome=" ".join(str(outcome).split()))
