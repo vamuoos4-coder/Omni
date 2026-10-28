@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; }
+body { margin: 0; padding: 1rem; }
+main { max-width: 1000px; margin: 0 auto; }
+header { display: flex; align-items: center; gap: .7rem; }
+h1, h2 { margin: .35rem 0; }
+section { margin: 1rem 0; }
+textarea, input { box-sizing: border-box; width: 100%; padding: .55rem; font: inherit; }
+button { padding: .45rem .8rem; margin: .25rem .35rem .25rem 0; font: inherit; }
+.buttons { margin-top: .45rem; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(127,127,127,.12); padding: .7rem; border-radius: 4px; }
+#events { min-height: 10rem; max-height: 45vh; overflow: auto; font: 12px/1.45 ui-monospace, monospace; }
+.dot { width: .8rem; height: .8rem; display: inline-block; border-radius: 50%; background: #888; }
+.dot.online { background: #18a558; }
+.dot.offline { background: #d43c38; }
+dialog { width: min(32rem, calc(100% - 2rem)); border: 1px solid #888; border-radius: 6px; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+#ask-options { margin: .5rem 0; }

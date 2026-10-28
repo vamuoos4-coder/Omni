@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Omni Agent</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <span id="connection-dot" class="dot offline" aria-label="Disconnected"></span>
+      <h1>Omni Agent</h1>
+      <span id="connection-label">Connecting…</span>
+    </header>
+
+    <section aria-labelledby="health-heading">
+      <h2 id="health-heading">Server health</h2>
+      <pre id="health">Loading health…</pre>
+    </section>
+
+    <section aria-labelledby="task-heading">
+      <h2 id="task-heading">Smoke test</h2>
+      <label for="task">Task</label>
+      <textarea id="task" rows="3" placeholder="Enter a task for the agent"></textarea>
+      <div class="buttons">
+        <button id="run" type="button">Run</button>
+        <button id="stop" type="button">Stop</button>
+      </div>
+      <pre id="request-status" aria-live="polite"></pre>
+    </section>
+
+    <section aria-labelledby="events-heading">
+      <h2 id="events-heading">Raw event log</h2>
+      <pre id="events" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <dialog id="ask-dialog">
+    <form method="dialog" id="ask-form">
+      <h2 id="ask-title">Agent asks</h2>
+      <p id="ask-text"></p>
+      <div id="ask-options"></div>
+      <label id="answer-label" for="answer-text">Answer</label>
+      <input id="answer-text" autocomplete="off">
+      <div class="buttons">
+        <button id="answer-submit" type="submit">Answer</button>
+        <button id="answer-cancel" type="button">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>
