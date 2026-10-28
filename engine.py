@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+from pathlib import Path
 import shutil
 import socket
 import subprocess
@@ -53,7 +54,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(APP_DIR, "reports")
 SCREENSHOTS_DIR = os.path.join(APP_DIR, "screenshots")
 SKILLS_DIR = os.path.join(APP_DIR, "skills")
-SKILL_ACTIONS = frozenset({"open_app", "type_text", "press_key", "open_url", "youtube_search",
+SKILL_ACTIONS = frozenset({"open_app", "type_text", "press_key", "open_url", "open_file", "youtube_search",
                            "open_path", "play_song", "web_search", "read_page", "save_note",
                            "wait", "click", "double_click", "right_click", "scroll"})
 MAX_SEARCHES = 6
@@ -83,6 +84,7 @@ Actions:
 - open_url      args: {"url": "https://..."}
 - youtube_search args: {"query": "..."}            opens YouTube results directly
 - open_path     args: {"path": "C:/folder or file"}
+- open_file     args: {"path": "workspace-relative or full path"} opens a workspace file safely
 - play_song     args: {"name": "part of song file name"}   searches the Music folder
 - web_search    args: {"query": "..."}             returns up to 5 titles, URLs and snippets
 - read_page     args: {"url": "https://..."}       reads safe public web pages (about 6000 chars)
@@ -96,6 +98,13 @@ only the user's task. For research, state only facts observed in pages you read 
 leads, not evidence), and save a note with the exact source URL for each important fact. Search and
 page-read results must be considered before the next decision. Limits are 6 searches and 8 page reads;
 when a limit is reached, finish the task. A Markdown report is saved automatically at completion.
+
+WORKSPACE FILE ROUTING:
+- For any task to create or change code or a file (including html, htm, css, js, py, txt, md, json), use the workspace coding tools write_file or edit_file. Never type file contents into Notepad and save with Ctrl+S.
+- If a needed file's location is unknown, use list_files or search_files in the workspace first. If still not found, ask the user; never guess a path.
+- Use Notepad only when the user explicitly asks to see or use Notepad. Then save with Ctrl+S, wait for the File name box, type the FULL path inside the workspace root shown in context, and press Enter. The engine records successful Notepad saves.
+- If the user asks to open or show a result file, include an open_file step with its known path.
+- Respect the task context's “Files known in this task” list; do not invent or assume a save location.
 
 Rules: the engine automatically waits about 1.5 seconds after a successful open_app. Do exactly
 what was asked, nothing more. Do the typing step BEFORE opening a browser (a browser steals focus).
@@ -145,7 +154,8 @@ contains its centre and set dx/dy precisely."""
 PLANNER_SYSTEM = """You are a task planner for a Windows desktop automation agent. Infer intended meaning and correct spelling mistakes in the goal. Return ONLY valid JSON, with no markdown or other text, in exactly this shape:
 {"goal":"...","steps":[{"id":1,"title":"..."}],"needs_vision":false,"screen_first":false,"reason":"one short sentence"}
 Make 3 to 8 short, actionable steps. Use consecutive integer ids starting at 1.
-Set needs_vision true when the task needs seeing or interacting with something direct actions cannot reach: buttons, menus or links inside apps/pages, selecting items, reading screen text, checking visual state, or filling forms. Set it false when open_app, type_text, press_key, open_url, youtube_search, open_path, play_song, or research tools can do the job.
+For creating or changing code or any file, route to the workspace tools write_file/edit_file; never plan to type file contents into Notepad. For unknown file locations, plan list_files/search_files first and ask the user if not found; never guess paths. Use Notepad only when explicitly requested and then save to a full path inside the workspace root. If the user asks to open/show the result, include an open_file step after creating or editing it.
+Set needs_vision true when the task needs seeing or interacting with something direct actions cannot reach: buttons, menus or links inside apps/pages, selecting items, reading screen text, checking visual state, or filling forms. Set it false when open_app, type_text, press_key, open_url, open_file, youtube_search, open_path, play_song, or research tools can do the job.
 Set screen_first true when the plan depends on what is currently on screen, such as closing a popup or clicking a button in an already-open window. Give a short reason for the vision decision. For research tasks, plan search, read the best sources, take notes with source URLs, then write the report."""
 
 REPLAN_SYSTEM = """You revise an automation plan after reality changed. Return ONLY valid JSON containing ONLY the remaining steps:
@@ -832,6 +842,37 @@ def _tool_event(settings, event_type, **fields):
             pass
 
 
+def _workspace_file_path(raw_path, settings=None, require_absolute=False):
+    """Resolve a path inside the configured workspace, rejecting traversal and symlink escapes."""
+    settings = settings or {}
+    text = str(raw_path or "").strip().strip('"')
+    if not text:
+        return None, "file path is empty"
+    root = Path(settings.get("workspace_dir") or APP_DIR).expanduser().resolve()
+    candidate_input = Path(os.path.expandvars(os.path.expanduser(text)))
+    if ".." in candidate_input.parts:
+        return None, "path traversal is not allowed"
+    if require_absolute and not candidate_input.is_absolute():
+        return None, "a full absolute path inside the workspace is required"
+    candidate = (candidate_input if candidate_input.is_absolute() else root / candidate_input).resolve()
+    try:
+        common = os.path.commonpath((str(root), str(candidate)))
+        if os.path.normcase(common) != os.path.normcase(str(root)):
+            return None, "path is outside the workspace"
+    except (OSError, ValueError):
+        return None, "path is outside the workspace"
+    if candidate == root:
+        return None, "workspace root is not a file"
+    return candidate, ""
+
+
+def _open_file_in_browser(file_uri, browser=""):
+    if browser and re.fullmatch(r"[A-Za-z0-9_. -]+", browser):
+        subprocess.Popen(f'start "" {browser} "{file_uri}"', shell=True)
+    else:
+        webbrowser.open(file_uri)
+
+
 def _public_url_or_error(url):
     """Reject non-HTTP(S), local names, and every non-public DNS result."""
     try:
@@ -1026,6 +1067,21 @@ def run_action(action, args, settings=None):
     settings = settings or {}
     state = settings.setdefault("_research_state", {"searches": 0, "pages_read": 0, "notes": [],
                                                    "research_started": False, "answer": ""})
+    if action == "open_file":
+        path, error = _workspace_file_path(args.get("path"), settings)
+        if error:
+            return f"refused: {error}"
+        if not path.is_file():
+            return f"file not found in workspace: {path}"
+        if path.suffix.lower() in (".html", ".htm"):
+            file_uri = path.as_uri()
+            _open_file_in_browser(file_uri, settings.get("browser", ""))
+            how = "browser"
+        else:
+            subprocess.Popen(["notepad.exe", str(path)])
+            how = "Notepad"
+        _tool_event(settings, "file_opened", path=str(path), how=how)
+        return f"Opened {path} in {how}."
     if action == "web_search":
         state["research_started"] = True
         query = str(args.get("query", "")).strip()
@@ -1283,6 +1339,8 @@ def _action_label(action, args):
         return f"press_key {args.get('keys', '')}".strip()
     if action == "open_url":
         return f"open_url {args.get('url', '')}".strip()
+    if action == "open_file":
+        return f"open_file {args.get('path', '')}".strip()
     if action == "youtube_search":
         return f"youtube_search {args.get('query', '')}".strip()
     if action == "web_search":
@@ -1359,6 +1417,13 @@ def run_task(task, settings, emit, stop_event):
     screenshot_sequence = 0
     research_state = {"searches": 0, "pages_read": 0, "notes": [],
                       "research_started": False, "answer": ""}
+    workspace_root = Path(settings.get("workspace_dir") or APP_DIR).expanduser().resolve()
+    created_files = settings.get("created_files")
+    if not isinstance(created_files, list):
+        created_files = []
+    settings["created_files"] = created_files
+    notepad_save_stage = "idle"
+    notepad_save_path = None
     report_path = ""
     consecutive_failures = 0
     step_action_counts = {}
@@ -1376,6 +1441,26 @@ def run_task(task, settings, emit, stop_event):
             emit(event)
         except Exception:
             pass
+
+    def files_context():
+        if not created_files:
+            return f"Workspace root: {workspace_root}\nFiles known in this task: none yet."
+        rows = [f"{item['path']} (how: {item.get('how', 'unknown')})" for item in created_files
+                if isinstance(item, dict) and item.get("path")]
+        return (f"Workspace root: {workspace_root}\nFiles known in this task: " +
+                ("; ".join(rows) if rows else "none yet."))
+
+    def record_created_file(path, how):
+        full_path = str(Path(path).expanduser().resolve())
+        existing = next((item for item in created_files
+                         if isinstance(item, dict) and item.get("path") and
+                         os.path.normcase(str(item["path"])) == os.path.normcase(full_path)), None)
+        if existing:
+            if how not in existing.get("how", ""):
+                existing["how"] = (existing.get("how", "") + "; " + how).strip("; ")
+        else:
+            created_files.append({"path": full_path, "how": how})
+        send("file_saved", path=full_path, how=how)
 
     settings["_research_state"] = research_state
     settings["_emit_event"] = send
@@ -1460,7 +1545,7 @@ def run_task(task, settings, emit, stop_event):
             outcome = "Could not initialize the model client."
             return
 
-        planner_user = "Task: " + task
+        planner_user = "Task: " + task + "\n\n" + files_context()
         if skill_guidance:
             planner_user += "\n\n" + skill_guidance
         planner_system = PLANNER_SYSTEM + (SKILL_SAFETY_ADDON if skill_guidance else "")
@@ -1579,6 +1664,8 @@ def run_task(task, settings, emit, stop_event):
             context = {"task": task, "old_plan": plan or {}, "completed_steps": done_steps,
                        "last_action_results": action_history[-6:], "reason": reason,
                        "next_step_id": last_completed + 1,
+                       "workspace_root": str(workspace_root),
+                       "files_known_in_this_task": files_context(),
                        "skill_guidance": skill_guidance if skill_guidance else ""}
             replan_system = REPLAN_SYSTEM + (
                 " Include a one-sentence `screen` field describing the attached screenshot."
@@ -1645,7 +1732,7 @@ def run_task(task, settings, emit, stop_event):
                 send("warning", text=outcome)
                 loop_ended = True
                 break
-            call_msgs = msgs
+            call_msgs = list(msgs)
             current_screenshot_b64 = None
             if vision:
                 current_screenshot_b64 = capture_screenshot()
@@ -1653,6 +1740,8 @@ def run_task(task, settings, emit, stop_event):
                     {"type": "text", "text": msgs[-1]["content"] + "\n(Latest screenshot with grid attached.)"},
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + current_screenshot_b64}},
                 ]}]
+            call_msgs[0] = dict(call_msgs[0])
+            call_msgs[0]["content"] += "\n\n" + files_context()
             try:
                 api_calls += 1
                 response = call_model(f"step {action_index}" + (" (vision)" if vision else ""),
@@ -1803,11 +1892,20 @@ def run_task(task, settings, emit, stop_event):
                         send("result", text="NOT RUN", step_id=rest.get("step"), skipped=True)
                     break
 
+                pending_notepad_path = None
+                save_path_error = ""
+                if action == "type_text" and notepad_save_stage == "await_path":
+                    pending_notepad_path, save_path_error = _workspace_file_path(
+                        args.get("text"), settings, require_absolute=True)
                 try:
-                    action_runner = settings.get("action_runner", run_action)
-                    result = action_runner(action, args, settings)
-                    if action == "open_app" and not _action_failed(result):
-                        sleep(1.5)
+                    if save_path_error:
+                        result = "refused: Notepad save path must be a full path inside the workspace (" + save_path_error + ")"
+                        send("warning", text=result)
+                    else:
+                        action_runner = settings.get("action_runner", run_action)
+                        result = action_runner(action, args, settings)
+                        if action == "open_app" and not _action_failed(result):
+                            sleep(1.5)
                 except Exception as exc:
                     try:
                         import pyautogui
@@ -1821,6 +1919,24 @@ def run_task(task, settings, emit, stop_event):
                         emergency_stop = True
                     else:
                         result = f"action failed: {exc}"
+
+                if not _action_failed(result):
+                    if action == "open_app" and fix_app_name(str(args.get("name", ""))).lower() == "notepad":
+                        notepad_save_stage = "idle"
+                        notepad_save_path = None
+                    elif action == "type_text" and notepad_save_stage == "await_path" and pending_notepad_path:
+                        notepad_save_stage = "path_typed"
+                        notepad_save_path = pending_notepad_path
+                    elif action == "press_key":
+                        key_name = "+".join(part.strip().lower() for part in
+                                             str(args.get("keys", "")).split("+") if part.strip())
+                        if key_name == "ctrl+s":
+                            notepad_save_stage = "await_path"
+                            notepad_save_path = None
+                        elif key_name == "enter" and notepad_save_stage == "path_typed" and notepad_save_path:
+                            record_created_file(notepad_save_path, "Saved with Notepad")
+                            notepad_save_stage = "idle"
+                            notepad_save_path = None
 
                 failed = _action_failed(result)
                 result_text = str(result)
@@ -1915,6 +2031,7 @@ def run_task(task, settings, emit, stop_event):
                     plan["goal"] if plan else task,
                     research_state.get("answer") or outcome,
                     research_state["notes"])
+                record_created_file(report_path, "Research report")
                 send("report_saved", file_path=report_path)
                 if settings.get("open_report_notepad", True):
                     warning = open_report_in_notepad(report_path)
@@ -1949,6 +2066,7 @@ def run_task(task, settings, emit, stop_event):
              searches=research_state["searches"], pages_read=research_state["pages_read"],
              notes_saved=len(research_state["notes"]), report_path=report_path,
              vision_used=vision_summary, replans=replan_count, skill_name=skill_name,
+             created_files=[dict(item) for item in created_files if isinstance(item, dict)],
              finished_by_finish=finished_by_finish,
              seconds=round(time.monotonic() - started, 2),
              outcome=" ".join(str(outcome).split()))

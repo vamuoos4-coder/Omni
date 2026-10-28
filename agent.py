@@ -162,6 +162,12 @@ class App:
         if kind == "log":
             self._append(stamp, event.get("text", ""))
             return
+        if kind == "file_opened":
+            self._append(stamp, f"File opened in {event.get('how', 'application')}: {event.get('path', '')}")
+            return
+        if kind == "file_saved":
+            self._append(stamp, f"File saved ({event.get('how', 'saved')}): {event.get('path', '')}")
+            return
         if kind == "plan":
             note = event.get("note", "") if event.get("based_on_screen") else ""
             self._render_plan_checklist(event.get("goal", ""), event.get("steps", []), note=note)
@@ -247,6 +253,9 @@ class App:
                          f" | Total API calls {event.get('total_api_calls', event.get('api_calls', 0))}" +
                          f" | Skill {'@' + event.get('skill_name', '') if event.get('skill_name') else 'none'}" +
                          f" | {event.get('seconds', 0)} seconds")
+            for item in event.get("created_files", []):
+                if isinstance(item, dict) and item.get("path"):
+                    self._append(stamp, f"File saved ({item.get('how', 'saved')}): {item['path']}")
             if self._skills_window and self._skills_window.winfo_exists():
                 self._refresh_skills_tree()
 
@@ -658,7 +667,7 @@ class App:
                     "model": self.model.get().strip(), "browser": self.browser.get().strip(),
                     "vision_mode": self.vision_mode.get(), "batch_actions": self.batch_actions.get(),
                     "open_report_notepad": self.open_report_notepad.get(),
-                    "initial_logs_emitted": True}
+                    "workspace_dir": HERE, "initial_logs_emitted": True}
         if settings["vision_mode"] == "on":
             self.root.iconify()
         threading.Thread(target=self._run, args=(task, settings), daemon=True).start()

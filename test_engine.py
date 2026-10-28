@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+from pathlib import Path
 import sys
 import tempfile
 import threading
@@ -871,6 +872,144 @@ class SkillTests(unittest.TestCase):
         self.assertTrue(click["args"]["target"].startswith("Save at the target"))
         self.assertNotIn("B2", json.dumps(click))
         self.assertNotIn("120", json.dumps(click))
+
+
+class FileOpenTests(unittest.TestCase):
+    def test_workspace_routing_rules_are_in_system_and_planner_prompts(self):
+        for prompt in (engine.SYSTEM, engine.PLANNER_SYSTEM):
+            self.assertIn("write_file", prompt)
+            self.assertIn("edit_file", prompt)
+            self.assertIn("list_files", prompt)
+            self.assertIn("search_files", prompt)
+            self.assertIn("never guess", prompt.lower())
+        self.assertIn("Never type file contents into Notepad", engine.SYSTEM)
+        self.assertIn("open_file", engine.SYSTEM)
+        self.assertIn("open_file", engine.SKILL_ACTIONS)
+        self.assertIn("FULL path inside the workspace root", engine.SYSTEM)
+
+    def test_html_opens_with_file_uri_and_respects_browser_setting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            html_path = Path(folder, "page with space.html")
+            html_path.write_text("<h1>test</h1>", encoding="utf-8")
+            uri = html_path.resolve().as_uri()
+            events = []
+            settings = {"workspace_dir": folder,
+                        "_emit_event": lambda kind, **fields: events.append({"type": kind, **fields})}
+            with patch("engine.webbrowser.open") as browser_open:
+                result = run_action("open_file", {"path": str(html_path)}, settings)
+            self.assertIn(str(html_path.resolve()), result)
+            browser_open.assert_called_once_with(uri)
+            self.assertEqual(events[0], {"type": "file_opened", "path": str(html_path.resolve()),
+                                         "how": "browser"})
+
+            with patch("engine.subprocess.Popen") as popen:
+                run_action("open_file", {"path": "page with space.html"},
+                           {"workspace_dir": folder, "browser": "chrome"})
+            popen.assert_called_once()
+            self.assertIn("chrome", popen.call_args.args[0])
+            self.assertIn(uri, popen.call_args.args[0])
+
+    def test_text_file_launches_notepad_with_full_resolved_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            text_path = Path(folder, "readme.txt")
+            text_path.write_text("hello", encoding="utf-8")
+            with patch("engine.subprocess.Popen") as popen:
+                result = run_action("open_file", {"path": "readme.txt"},
+                                    {"workspace_dir": folder})
+            popen.assert_called_once_with(["notepad.exe", str(text_path.resolve())])
+            self.assertIn("Notepad", result)
+
+    def test_open_file_refuses_traversal_and_paths_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            outside_file = Path(outside, "outside.txt")
+            outside_file.write_text("no", encoding="utf-8")
+            with patch("engine.subprocess.Popen") as popen:
+                traversal = run_action("open_file", {"path": "../outside.txt"},
+                                       {"workspace_dir": root})
+                absolute = run_action("open_file", {"path": str(outside_file)},
+                                      {"workspace_dir": root})
+            self.assertTrue(traversal.startswith("refused:"))
+            self.assertIn("traversal", traversal)
+            self.assertTrue(absolute.startswith("refused:"))
+            self.assertIn("outside the workspace", absolute)
+            popen.assert_not_called()
+
+    def test_missing_open_file_returns_clear_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = run_action("open_file", {"path": "absent.txt"}, {"workspace_dir": folder})
+        self.assertTrue(result.startswith("file not found in workspace:"))
+
+    def test_created_file_context_is_present_when_a_saved_skill_is_used(self):
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as skills:
+            known_path = str(Path(workspace, "prior.txt").resolve())
+            engine.save_skill({
+                "name": "demo", "description": "A saved workflow.",
+                "created": "2026-01-01T00:00:00+00:00", "updated": "2026-01-01T00:00:00+00:00",
+                "uses": 0, "last_used": None, "original_task": "make a note", "goal": "Make a note",
+                "steps": ["Open the editor"], "trace": [], "variables": [],
+                "needs_vision": False, "hints": [],
+            }, "demo", skills)
+            client = FakeClient([plan_reply(), response("finish", args={"message": "done"})])
+            events = []
+            settings = {"model": "offline-test", "client": client, "workspace_dir": workspace,
+                        "skills_dir": skills, "created_files": [{"path": known_path, "how": "Saved earlier"}],
+                        "sleep": lambda _seconds: None}
+            run_task("@demo make the note", settings, events.append, threading.Event())
+            executor_context = "\\n".join(message.get("content", "") for message in client.calls[1]["messages"]
+                                           if isinstance(message.get("content"), str))
+            self.assertIn("Files known in this task:", executor_context)
+            self.assertIn(known_path, executor_context)
+            self.assertIn("SKILL @demo", executor_context)
+
+    def test_notepad_save_records_path_and_context_survives_replan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            saved_path = str(Path(folder, "created note.txt").resolve())
+            replacement = json.dumps({"steps": [
+                {"id": 2, "title": "Review the saved note"},
+                {"id": 3, "title": "Finish"}]})
+            client = FakeClient([
+                plan_reply(),
+                response("open_app", 1, {"name": "notepad"}),
+                response("press_key", 1, {"keys": "ctrl+s"}),
+                response("wait", 1, {"seconds": 1}),
+                response("type_text", 1, {"text": saved_path}),
+                response("press_key", 1, {"keys": "enter"}),
+                response("replan", 2, {"reason": "The file is saved; verify it."}),
+                replacement,
+                response("finish", 2, {"message": "Saved and reviewed."}),
+            ])
+            action_calls = []
+            events = []
+            settings = {"model": "offline-test", "client": client, "workspace_dir": folder,
+                        "sleep": lambda _seconds: None,
+                        "action_runner": lambda action, args, _settings:
+                            action_calls.append((action, dict(args))) or "ok"}
+            run_task("Create a note in Notepad", settings, events.append, threading.Event())
+
+            typed_paths = [args["text"] for action, args in action_calls if action == "type_text"]
+            self.assertEqual(typed_paths, [saved_path])
+            recorded = events[-1]["created_files"]
+            self.assertEqual(recorded, [{"path": saved_path, "how": "Saved with Notepad"}])
+            self.assertTrue(any(event["type"] == "file_saved" and event["path"] == saved_path
+                                for event in events))
+
+            def message_text(call):
+                parts = []
+                for message in call["messages"]:
+                    content = message.get("content", "")
+                    if isinstance(content, str):
+                        parts.append(content)
+                    elif isinstance(content, list):
+                        parts.extend(part.get("text", "") for part in content if isinstance(part, dict))
+                return "\\n".join(parts)
+
+            # Every executor response turn carries the current inventory; after the re-plan
+            # both the re-planner and the next executor call receive the recorded full path.
+            for call in client.calls[1:]:
+                self.assertIn("Files known in this task:", message_text(call))
+            self.assertIn(saved_path, message_text(client.calls[7]))
+            self.assertIn(saved_path, message_text(client.calls[8]))
+            self.assertTrue(any(event["type"] == "replan" for event in events))
 
 
 class WebResearchTests(unittest.TestCase):

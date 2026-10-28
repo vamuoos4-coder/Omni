@@ -16,3 +16,4 @@
 - Added vision/re-plan logging and summary metrics, plus fake-client tests for vision modes, image fallback, planner/re-plan flow, screen events, and call counts.
 - Added saved reusable skills with safe extraction/redaction, @skill guidance, usage tracking, and a searchable Skills manager.
 - Added immediate, readable model-operation logs with five-second heartbeats, reply durations, and clear 90-second timeout warnings; checklist progress now completes skipped prior steps and finalizes correctly on finish, stop, or failure.
+- Added workspace-first file-task routing, task-scoped saved-file tracking, and safe open_file handling for browser-rendered HTML and Notepad-opened text files.
