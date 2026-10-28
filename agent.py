@@ -1,26 +1,13 @@
-"""Simple desktop automation agent (Windows) - v2 with optional vision.
-Type a task (typos are fine), the AI picks one action at a time, this script runs it.
-Works with any OpenAI-compatible endpoint (freellmapi, OpenRouter, OpenAI, Gemini compat...).
-"""
-import base64
+"""Simple Windows desktop automation agent UI. Orchestration lives in engine.py."""
 import ctypes
-import difflib
-import io
 import json
 import os
-import re
-import subprocess
 import threading
-import time
-import webbrowser
 import tkinter as tk
+from datetime import datetime
 from tkinter import scrolledtext
-from urllib.parse import quote_plus
 
-import pyautogui
-import pyperclip
-from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from engine import run_task
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -29,190 +16,6 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "config.json")
-MAX_STEPS = 15
-MAX_STEPS_VISION = 25
-COLS, ROWS = 16, 9
-pyautogui.FAILSAFE = True  # slam mouse into a screen corner to abort
-BROWSER = ""  # set from the UI; blank = Windows default browser
-
-APP_ALIASES = {
-    "calculator": "calc", "paint": "mspaint", "edge": "msedge", "word": "winword",
-    "file explorer": "explorer", "files": "explorer", "vscode": "code",
-    "command prompt": "cmd", "terminal": "cmd", "task manager": "taskmgr",
-}
-KNOWN_APPS = ["notepad", "chrome", "brave", "msedge", "firefox", "calc", "explorer", "mspaint",
-              "winword", "excel", "powerpnt", "spotify", "code", "cmd", "taskmgr", "whatsapp", "discord"]
-
-SYSTEM = """You control a Windows PC by choosing ONE action at a time.
-The user often makes spelling mistakes. Infer what they meant (e.g. "notpad" = notepad,
-"yutube" = youtube) and use correct spelling when typing or searching, unless the odd
-spelling is clearly intended.
-
-Reply with ONLY a JSON object, no markdown, no extra text:
-{"thought": "short reasoning", "action": "<name>", "args": {...}}
-
-Actions:
-- open_app      args: {"name": "notepad" | "chrome" | "calc" | "explorer" ...}
-- type_text     args: {"text": "..."}              types into the focused window
-- press_key     args: {"keys": "enter"} or {"keys": "ctrl+s"}
-- open_url      args: {"url": "https://..."}
-- youtube_search args: {"query": "..."}            opens YouTube results directly
-- open_path     args: {"path": "C:/folder or file"}
-- play_song     args: {"name": "part of song file name"}   searches the Music folder
-- wait          args: {"seconds": 2}
-- finish        args: {"message": "what was done"}
-
-Rules: after open_app, use wait 1-2 seconds before type_text. Do exactly what was asked,
-nothing more. Do the typing step BEFORE opening a browser (a browser steals focus).
-Call finish when the task is complete."""
-
-VISION_ADDON = """
-
-VISION IS ON. Each turn you get a screenshot of the whole screen with a red grid.
-Columns are letters A-P (left to right), rows are numbers 1-9 (top to bottom); each cell
-is labeled in its top-left corner, e.g. "F5".
-Extra actions:
-- click         args: {"cell": "F5", "dx": 0.5, "dy": 0.5}   dx/dy (0 to 1) = position inside the cell, default centre
-- double_click  same args as click
-- right_click   same args as click
-- scroll        args: {"direction": "down" | "up", "amount": 3}
-Always look at the latest screenshot to check whether your last action worked. If it did not,
-try something different instead of repeating it. Prefer open_url/youtube_search/open_app
-over clicking when they can do the job. To click a small target, pick the cell that
-contains its centre and set dx/dy precisely."""
-
-
-def open_in_browser(url):
-    if '"' in url or not url.startswith(("http://", "https://")):
-        return False
-    if BROWSER and re.fullmatch(r"[\w .\-]+", BROWSER):
-        subprocess.Popen(f'start "" {BROWSER} "{url}"', shell=True)
-    else:
-        webbrowser.open(url)
-    return True
-
-
-def fix_app_name(name):
-    low = name.lower().strip()
-    if low in APP_ALIASES:
-        return APP_ALIASES[low]
-    if low in KNOWN_APPS:
-        return low
-    close = difflib.get_close_matches(low, KNOWN_APPS + list(APP_ALIASES), n=1, cutoff=0.75)
-    if close:
-        return APP_ALIASES.get(close[0], close[0])
-    return name
-
-
-def grab():
-    """Screenshot with a labeled grid, returned as base64 JPEG."""
-    shot = pyautogui.screenshot()
-    sw, sh = shot.size
-    w = 1280
-    h = int(sh * w / sw)
-    img = shot.resize((w, h)).convert("RGBA")
-    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(ov)
-    try:
-        font = ImageFont.truetype("arial.ttf", 13)
-    except Exception:
-        font = ImageFont.load_default()
-    cw, ch = w / COLS, h / ROWS
-    for c in range(COLS + 1):
-        x = int(c * cw)
-        d.line([(x, 0), (x, h)], fill=(255, 0, 0, 110), width=1)
-    for r in range(ROWS + 1):
-        y = int(r * ch)
-        d.line([(0, y), (w, y)], fill=(255, 0, 0, 110), width=1)
-    for c in range(COLS):
-        for r in range(ROWS):
-            d.text((int(c * cw) + 3, int(r * ch) + 2), f"{chr(65 + c)}{r + 1}",
-                   fill=(255, 0, 0, 235), font=font)
-    img = Image.alpha_composite(img, ov).convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=70)
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def cell_to_xy(args):
-    m = re.fullmatch(r"([A-Pa-p])([1-9])", str(args.get("cell", "")).strip())
-    if not m:
-        return None
-    col = ord(m.group(1).upper()) - 65
-    row = int(m.group(2)) - 1
-    dx = min(max(float(args.get("dx", 0.5)), 0.0), 1.0)
-    dy = min(max(float(args.get("dy", 0.5)), 0.0), 1.0)
-    sw, sh = pyautogui.size()
-    return int((col + dx) / COLS * sw), int((row + dy) / ROWS * sh)
-
-
-def run_action(action, args):
-    if action == "open_app":
-        name = fix_app_name(str(args.get("name", "")))
-        if not re.fullmatch(r"[\w .\-]+", name):
-            return "refused: invalid app name"
-        subprocess.Popen(f'start "" {name}', shell=True)
-        return f"opened {name}"
-    if action == "type_text":
-        time.sleep(0.4)
-        pyperclip.copy(str(args.get("text", "")))
-        pyautogui.hotkey("ctrl", "v")
-        return "typed text"
-    if action == "press_key":
-        keys = [k.strip().lower() for k in str(args.get("keys", "")).split("+") if k.strip()]
-        if not keys:
-            return "no keys given"
-        pyautogui.hotkey(*keys)
-        return f"pressed {'+'.join(keys)}"
-    if action == "open_url":
-        url = str(args.get("url", ""))
-        return f"opened {url}" if open_in_browser(url) else "refused: url must start with http(s)"
-    if action == "youtube_search":
-        open_in_browser("https://www.youtube.com/results?search_query=" + quote_plus(str(args.get("query", ""))))
-        return "opened youtube results"
-    if action == "open_path":
-        path = os.path.expandvars(os.path.expanduser(str(args.get("path", ""))))
-        if not os.path.exists(path):
-            return f"path not found: {path}"
-        os.startfile(path)
-        return f"opened {path}"
-    if action == "play_song":
-        want = str(args.get("name", "")).lower()
-        music = os.path.join(os.path.expanduser("~"), "Music")
-        for root, _, files in os.walk(music):
-            for f in files:
-                if want in f.lower() and f.lower().endswith((".mp3", ".wav", ".flac", ".m4a", ".ogg")):
-                    os.startfile(os.path.join(root, f))
-                    return f"playing {f}"
-        return "song not found in Music folder"
-    if action in ("click", "double_click", "right_click"):
-        xy = cell_to_xy(args)
-        if not xy:
-            return "bad cell, use a letter A-P and number 1-9 like F5"
-        x, y = xy
-        pyautogui.moveTo(x, y, duration=0.25)
-        if action == "click":
-            pyautogui.click()
-        elif action == "double_click":
-            pyautogui.doubleClick()
-        else:
-            pyautogui.rightClick()
-        return f"{action} at cell {args.get('cell')}"
-    if action == "scroll":
-        amount = int(args.get("amount", 3)) * 100
-        pyautogui.scroll(-amount if str(args.get("direction", "down")).lower() == "down" else amount)
-        return "scrolled"
-    if action == "wait":
-        time.sleep(min(float(args.get("seconds", 1)), 10))
-        return "waited"
-    return f"unknown action: {action}"
-
-
-def parse_json(text):
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise ValueError("no JSON found")
-    return json.loads(m.group(0))
 
 
 class App:
@@ -221,10 +24,12 @@ class App:
         root.title("Simple Automation Agent v2")
         root.geometry("660x640")
         self.stop = threading.Event()
+        self.plan_rows = {}
         cfg = {}
         if os.path.exists(CONFIG):
             try:
-                cfg = json.load(open(CONFIG, encoding="utf-8"))
+                with open(CONFIG, encoding="utf-8") as f:
+                    cfg = json.load(f)
             except Exception:
                 pass
 
@@ -236,6 +41,9 @@ class App:
         self.vision = tk.BooleanVar(value=cfg.get("vision", False))
         tk.Checkbutton(root, text="Use vision (sends a screenshot every step; window minimizes while running)",
                        variable=self.vision).pack(anchor="w", padx=10)
+        self.batch_actions = tk.BooleanVar(value=cfg.get("batch_actions", True))
+        tk.Checkbutton(root, text="Batch actions (faster, not used with vision)",
+                       variable=self.batch_actions).pack(anchor="w", padx=10)
         self.remember = tk.BooleanVar(value=bool(cfg))
         tk.Checkbutton(root, text="Remember settings in config.json", variable=self.remember).pack(anchor="w", padx=10)
 
@@ -250,6 +58,13 @@ class App:
         tk.Button(bar, text="Stop", width=12, command=self.stop.set).pack(side="left", padx=6)
         tk.Label(bar, text="Emergency stop: slam the mouse into a screen corner").pack(side="left", padx=8)
 
+        self.plan_frame = tk.LabelFrame(root, text="Plan")
+        self.plan_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.plan_goal = tk.Label(self.plan_frame, text="No plan yet", anchor="w", justify="left")
+        self.plan_goal.pack(fill="x", padx=6, pady=(3, 0))
+        self.plan_list = tk.Frame(self.plan_frame)
+        self.plan_list.pack(fill="x", padx=6, pady=(0, 4))
+
         self.log = scrolledtext.ScrolledText(root, state="disabled")
         self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -260,92 +75,107 @@ class App:
         e.pack(fill="x", padx=10)
         return e
 
-    def say(self, msg):
-        def _do():
-            self.log.configure(state="normal")
-            self.log.insert("end", msg + "\n")
-            self.log.see("end")
-            self.log.configure(state="disabled")
-        self.root.after(0, _do)
+    def _append(self, timestamp, text):
+        for line in str(text).splitlines() or [""]:
+            self.log.insert("end", f"{timestamp}  {line}\n")
+        self.log.see("end")
+
+    def emit(self, event):
+        """Queue engine events onto Tk's main thread; engine never touches widgets."""
+        self.root.after(0, self._render_event, event)
+
+    def _render_event(self, event):
+        kind = event.get("type", "event")
+        stamp = event.get("time") or datetime.now().astimezone().isoformat(timespec="seconds")
+        if kind == "plan":
+            self.plan_goal.configure(text="Goal: " + event.get("goal", ""))
+            self.current_steps = event.get("steps", [])
+            for child in self.plan_list.winfo_children():
+                child.destroy()
+            self.plan_rows.clear()
+            for step in event.get("steps", []):
+                sid = step.get("id")
+                label = tk.Label(self.plan_list, text=f"○  {step.get('title', '')}", anchor="w")
+                label.pack(fill="x")
+                self.plan_rows[sid] = label
+            self._append(stamp, "Plan created: " + event.get("goal", ""))
+            return
+        if kind == "step_start":
+            self._set_step(event.get("step_id"), "running")
+            self._append(stamp, f"Step {event.get('step_id')} started")
+        elif kind == "step_done":
+            self._set_step(event.get("step_id"), "done")
+            self._append(stamp, f"Step {event.get('step_id')} done")
+        elif kind == "thought":
+            text = event.get("text", "")
+            if text:
+                self._append(stamp, "Thought: " + text)
+        elif kind == "batch":
+            self._append(stamp, f"Batch: {event.get('count', 1)} action(s)")
+        elif kind == "action":
+            suffix = " [NOT RUN]" if event.get("skipped") else ""
+            self._append(stamp, f"Action (step {event.get('step_id', '—')}): {event.get('action')} " +
+                         json.dumps(event.get("args", {}), ensure_ascii=False) + suffix)
+        elif kind == "result":
+            suffix = " [NOT RUN]" if event.get("skipped") else ""
+            self._append(stamp, "Result: " + event.get("text", "") + suffix)
+        elif kind in ("warning", "error"):
+            if kind == "warning" and "continuing without a plan" in event.get("text", ""):
+                self.plan_goal.configure(text="No plan (continuing without one)")
+            self._append(stamp, kind.upper() + ": " + event.get("text", ""))
+        elif kind == "summary":
+            self._append(stamp, "Summary: Goal: " + event.get("goal", "") + " | Outcome: " + event.get("outcome", "") +
+                         f" | Steps {event.get('steps_completed', 0)}/{event.get('steps_total', 0)}" +
+                         f" | Actions {event.get('actions_executed', 0)}" +
+                         f" | API calls {event.get('api_calls', 0)}" +
+                         f" | Calls saved (estimated) {event.get('estimated_calls_saved', 0)}" +
+                         f" | {event.get('seconds', 0)} seconds")
+
+    def _set_step(self, step_id, state):
+        label = self.plan_rows.get(step_id)
+        if not label:
+            return
+        step = next((item for item in getattr(self, "current_steps", []) if item.get("id") == step_id), None)
+        title = step.get("title", "") if step else label.cget("text").split("  ", 1)[-1]
+        marker = {"pending": "○", "running": "▶", "done": "✓"}[state]
+        label.configure(text=f"{marker}  {title}")
 
     def start(self):
-        global BROWSER
-        BROWSER = self.browser.get().strip()
         if self.remember.get():
-            json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
-                       "browser": BROWSER, "vision": self.vision.get()},
-                      open(CONFIG, "w", encoding="utf-8"))
+            with open(CONFIG, "w", encoding="utf-8") as f:
+                json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
+                           "browser": self.browser.get().strip(), "vision": self.vision.get(),
+                           "batch_actions": self.batch_actions.get()}, f)
         elif os.path.exists(CONFIG):
             os.remove(CONFIG)
         task = self.task.get("1.0", "end").strip()
         if not task or not self.model.get().strip():
-            self.say("Enter a model name and a task first.")
+            self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
             return
         self.stop.clear()
         self.run_btn.configure(state="disabled")
-        use_vision = self.vision.get()
-        if use_vision:
+        for child in self.plan_list.winfo_children():
+            child.destroy()
+        self.plan_rows.clear()
+        self.current_steps = []
+        self.plan_goal.configure(text="Planning…")
+        settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
+                    "model": self.model.get().strip(), "browser": self.browser.get().strip(),
+                    "vision": self.vision.get(), "batch_actions": self.batch_actions.get()}
+        if settings["vision"]:
             self.root.iconify()
-        threading.Thread(target=self.loop, args=(task, use_vision), daemon=True).start()
+        threading.Thread(target=self._run, args=(task, settings), daemon=True).start()
 
-    def loop(self, task, use_vision):
+    def _run(self, task, settings):
         try:
-            client = OpenAI(base_url=self.base.get().strip() or None,
-                            api_key=self.key.get().strip() or "none")
-            msgs = [{"role": "system", "content": SYSTEM + (VISION_ADDON if use_vision else "")},
-                    {"role": "user", "content": "Task: " + task}]
-            self.say(f"=== Task: {task}  (vision {'ON' if use_vision else 'off'})")
-            if use_vision:
-                time.sleep(0.8)  # let our window minimize
-            for step in range(1, (MAX_STEPS_VISION if use_vision else MAX_STEPS) + 1):
-                if self.stop.is_set():
-                    self.say("Stopped.")
-                    return
-                call_msgs = msgs
-                if use_vision:
-                    b64 = grab()
-                    call_msgs = msgs[:-1] + [{"role": "user", "content": [
-                        {"type": "text", "text": msgs[-1]["content"] + "\n(Latest screenshot with grid attached.)"},
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
-                    ]}]
-                try:
-                    resp = client.chat.completions.create(model=self.model.get().strip(),
-                                                          messages=call_msgs, temperature=0)
-                except Exception as e:
-                    hint = "  (this model may not accept images - untick vision)" if use_vision else ""
-                    self.say(f"API ERROR: {e}{hint}")
-                    return
-                text = resp.choices[0].message.content or ""
-                msgs.append({"role": "assistant", "content": text})
-                try:
-                    data = parse_json(text)
-                    action, args = data.get("action", ""), data.get("args", {}) or {}
-                except Exception:
-                    self.say(f"[{step}] bad reply, asking again")
-                    msgs.append({"role": "user", "content": "Invalid. Reply with ONLY the JSON object."})
-                    continue
-                self.say(f"[{step}] {data.get('thought', '')}\n     -> {action} {json.dumps(args, ensure_ascii=False)}")
-                if action == "finish":
-                    self.say("Done: " + str(args.get("message", "")))
-                    return
-                try:
-                    result = run_action(action, args)
-                except pyautogui.FailSafeException:
-                    self.say("Emergency stop (mouse in corner).")
-                    return
-                except Exception as e:
-                    result = f"action failed: {e}"
-                self.say("     result: " + result)
-                msgs.append({"role": "user", "content": "Result: " + result})
-                time.sleep(1.2)
-            self.say("Reached the step limit.")
-        except Exception as e:
-            self.say(f"ERROR: {e}")
+            run_task(task, settings, self.emit, self.stop)
+        except Exception as exc:
+            self.emit({"type": "error", "time": "", "text": f"ERROR: {exc}"})
         finally:
-            def _restore():
+            def restore():
                 self.root.deiconify()
                 self.run_btn.configure(state="normal")
-            self.root.after(0, _restore)
+            self.root.after(0, restore)
 
 
 if __name__ == "__main__":
