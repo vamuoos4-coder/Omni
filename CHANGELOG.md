@@ -5,4 +5,6 @@
 - Added end-of-task summaries with goal, completed/total steps, API-call count, elapsed time, and outcome.
 - Added optional non-vision batching (up to four actions), stop-on-failure behavior, per-action step tracking, and automatic post-open-app waiting; vision remains single-action.
 - Added the default-on batch checkbox and saved preference, plus action/API/call-savings summary metrics.
-- Added offline fake-client/fake-action engine tests. `run.bat` remains unchanged.
+- Added `web_search`, SSRF-protected `read_page`, per-task `save_note`, sourced Markdown reports, research events, and an Open Reports Folder button.
+- Added research source/safety instructions and per-task search/page limits. `run.bat` installs `ddgs`, `requests`, and `trafilatura` alongside the existing packages.
+- Added offline fake-client/fake-action and mocked HTTP/DNS research tests.

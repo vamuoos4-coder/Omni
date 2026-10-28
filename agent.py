@@ -7,7 +7,7 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import scrolledtext
 
-from engine import run_task
+from engine import REPORTS_DIR, run_task
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -56,6 +56,7 @@ class App:
         self.run_btn = tk.Button(bar, text="Run", width=12, command=self.start)
         self.run_btn.pack(side="left")
         tk.Button(bar, text="Stop", width=12, command=self.stop.set).pack(side="left", padx=6)
+        tk.Button(bar, text="Open reports folder", command=self.open_reports_folder).pack(side="left", padx=6)
         tk.Label(bar, text="Emergency stop: slam the mouse into a screen corner").pack(side="left", padx=8)
 
         self.plan_frame = tk.LabelFrame(root, text="Plan")
@@ -119,6 +120,14 @@ class App:
         elif kind == "result":
             suffix = " [NOT RUN]" if event.get("skipped") else ""
             self._append(stamp, "Result: " + event.get("text", "") + suffix)
+        elif kind == "search":
+            self._append(stamp, f"Search: {event.get('query', '')} ({event.get('result_count', 0)} results)")
+        elif kind == "page_read":
+            self._append(stamp, f"Page read: {event.get('url', '')} ({event.get('chars', 0)} chars)")
+        elif kind == "note_saved":
+            self._append(stamp, f"Note saved ({event.get('count', 0)}): {event.get('source', '')}")
+        elif kind == "report_saved":
+            self._append(stamp, "Report saved: " + event.get("file_path", ""))
         elif kind in ("warning", "error"):
             if kind == "warning" and "continuing without a plan" in event.get("text", ""):
                 self.plan_goal.configure(text="No plan (continuing without one)")
@@ -129,6 +138,10 @@ class App:
                          f" | Actions {event.get('actions_executed', 0)}" +
                          f" | API calls {event.get('api_calls', 0)}" +
                          f" | Calls saved (estimated) {event.get('estimated_calls_saved', 0)}" +
+                         f" | Searches {event.get('searches', 0)}" +
+                         f" | Pages read {event.get('pages_read', 0)}" +
+                         f" | Notes saved {event.get('notes_saved', 0)}" +
+                         f" | Report {event.get('report_path', '')}" +
                          f" | {event.get('seconds', 0)} seconds")
 
     def _set_step(self, step_id, state):
@@ -139,6 +152,14 @@ class App:
         title = step.get("title", "") if step else label.cget("text").split("  ", 1)[-1]
         marker = {"pending": "○", "running": "▶", "done": "✓"}[state]
         label.configure(text=f"{marker}  {title}")
+
+    def open_reports_folder(self):
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        try:
+            os.startfile(REPORTS_DIR)
+        except Exception as exc:
+            self.emit({"type": "warning", "time": "",
+                       "text": f"Could not open reports folder: {exc}"})
 
     def start(self):
         if self.remember.get():

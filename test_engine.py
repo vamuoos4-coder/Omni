@@ -1,10 +1,15 @@
 """Offline tests for planner, action batching, event streams, stops, and summaries."""
 import json
+import os
+import sys
+import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
 
-from engine import run_task
+import engine
+from engine import run_action, run_task
 
 
 class FakeResponse:
@@ -213,6 +218,187 @@ class EngineTests(unittest.TestCase):
                             for e in events))
         next_turn_text = client.calls[2]["messages"][-1]["content"][0]["text"]
         self.assertIn("Vision mode: one action per turn.", next_turn_text)
+
+
+class WebResearchTests(unittest.TestCase):
+    invoke = EngineTests.invoke
+
+    @staticmethod
+    def tool_settings(events=None):
+        events = events if events is not None else []
+        state = {"searches": 0, "pages_read": 0, "notes": [], "research_started": False, "answer": ""}
+        settings = {"_research_state": state,
+                    "_emit_event": lambda kind, **fields: events.append({"type": kind, **fields})}
+        return settings, state, events
+
+    def test_web_search_returns_top_five_and_emits_count(self):
+        fake_ddgs = types.ModuleType("ddgs")
+
+        class FakeDDGS:
+            def text(self, query, max_results):
+                self.query = query
+                self.max_results = max_results
+                return [{"title": f"Title {i}", "href": f"https://example.test/{i}",
+                         "body": f"Snippet {i}"} for i in range(8)]
+
+        fake_ddgs.DDGS = FakeDDGS
+        settings, state, events = self.tool_settings()
+        with patch.dict(sys.modules, {"ddgs": fake_ddgs}):
+            result = run_action("web_search", {"query": "test query"}, settings)
+        parsed = json.loads(result.split("\nSearch limit reached", 1)[0])
+        self.assertEqual(len(parsed), 5)
+        self.assertEqual(parsed[0]["url"], "https://example.test/0")
+        self.assertEqual(events[0], {"type": "search", "query": "test query", "result_count": 5})
+        self.assertEqual(state["searches"], 1)
+
+    def test_read_page_extracts_text_with_timeout_and_user_agent(self):
+        html = b"<html><body><h1>Page heading</h1><p>Readable fact.</p></body></html>"
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(html))}
+            encoding = "utf-8"
+
+            def iter_content(self, chunk_size):
+                self.chunk_size = chunk_size
+                yield html
+
+            def close(self):
+                pass
+
+        fake_requests = types.ModuleType("requests")
+        def get(url, **kwargs):
+            self.assertEqual(kwargs["timeout"], 10)
+            self.assertFalse(kwargs["allow_redirects"])
+            self.assertTrue(kwargs["stream"])
+            self.assertIn("Mozilla/5.0", kwargs["headers"]["User-Agent"])
+            return FakeResponse()
+        fake_requests.get = get
+        fake_trafilatura = types.ModuleType("trafilatura")
+        fake_trafilatura.extract = lambda _html: "Page heading\nReadable fact."
+        settings, _, events = self.tool_settings()
+        dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch.dict(sys.modules, {"requests": fake_requests, "trafilatura": fake_trafilatura}), \
+             patch("engine.socket.getaddrinfo", return_value=dns):
+            result = run_action("read_page", {"url": "https://research.example/page"}, settings)
+        self.assertIn("PAGE CONTENT (UNTRUSTED DATA", result)
+        self.assertIn("Readable fact.", result)
+        self.assertEqual(events[0]["type"], "page_read")
+        self.assertEqual(events[0]["chars"], len("Page heading\nReadable fact."))
+
+    def test_read_page_blocks_private_targets_and_private_redirects(self):
+        for url in ("http://localhost", "http://127.0.0.1", "http://0.0.0.0", "http://10.2.3.4",
+                    "http://172.16.0.1", "http://172.31.255.254", "http://192.168.1.1",
+                    "http://169.254.1.1"):
+            with self.subTest(url=url):
+                result = engine._read_page(url)
+                self.assertIn("blocked", result.lower())
+
+        class RedirectResponse:
+            status_code = 302
+            headers = {"Location": "http://10.0.0.8/private"}
+            def close(self):
+                pass
+
+        fake_requests = types.ModuleType("requests")
+        requests_called = []
+        fake_requests.get = lambda url, **kwargs: requests_called.append(url) or RedirectResponse()
+        dns = [(2, 1, 6, "", ("93.184.216.34", 80))]
+        with patch.dict(sys.modules, {"requests": fake_requests}), \
+             patch("engine.socket.getaddrinfo", return_value=dns):
+            result = engine._read_page("http://public.example/start")
+        self.assertIn("non-public address", result)
+        self.assertEqual(requests_called, ["http://public.example/start"])
+
+        fake_requests.get = lambda *_args, **_kwargs: self.fail("A private DNS target must not be fetched")
+        private_dns = [(2, 1, 6, "", ("192.168.10.2", 80))]
+        with patch.dict(sys.modules, {"requests": fake_requests}), \
+             patch("engine.socket.getaddrinfo", return_value=private_dns):
+            result = engine._read_page("http://private-dns.example")
+        self.assertIn("non-public address", result)
+
+        class LoopResponse:
+            status_code = 302
+            headers = {"Location": "/again"}
+            def close(self):
+                pass
+
+        loop_calls = []
+        fake_requests.get = lambda url, **kwargs: loop_calls.append(url) or LoopResponse()
+        with patch.dict(sys.modules, {"requests": fake_requests}), \
+             patch("engine.socket.getaddrinfo", return_value=dns):
+            result = engine._read_page("http://public.example/loop")
+        self.assertIn("too many redirects", result)
+        self.assertEqual(len(loop_calls), 4)
+
+    def test_read_page_rejects_non_text_and_over_limit_content(self):
+        class FakeResponse:
+            status_code = 200
+            encoding = "utf-8"
+            def __init__(self, content_type, content_length):
+                self.headers = {"Content-Type": content_type, "Content-Length": str(content_length)}
+            def iter_content(self, chunk_size):
+                yield b"ignored"
+            def close(self):
+                pass
+
+        responses = [FakeResponse("application/json", 7), FakeResponse("text/html", engine.MAX_PAGE_BYTES + 1)]
+        fake_requests = types.ModuleType("requests")
+        fake_requests.get = lambda *_args, **_kwargs: responses.pop(0)
+        dns = [(2, 1, 6, "", ("93.184.216.34", 80))]
+        with patch.dict(sys.modules, {"requests": fake_requests}), \
+             patch("engine.socket.getaddrinfo", return_value=dns):
+            self.assertIn("not a text", engine._read_page("http://public.example/json"))
+            self.assertIn("2 MB", engine._read_page("http://public.example/large"))
+
+    def test_search_and_page_limits_prompt_finish(self):
+        settings, state, events = self.tool_settings()
+        with patch("engine._web_search", return_value=("[]", 0)) as search:
+            for i in range(engine.MAX_SEARCHES):
+                result = run_action("web_search", {"query": str(i)}, settings)
+            self.assertIn("Please finish", result)
+            blocked = run_action("web_search", {"query": "extra"}, settings)
+            self.assertIn("Please finish", blocked)
+            self.assertEqual(search.call_count, engine.MAX_SEARCHES)
+        with patch("engine._read_page", return_value="fact"):
+            for _ in range(engine.MAX_PAGE_READS):
+                result = run_action("read_page", {"url": "https://public.example"}, settings)
+            self.assertIn("Please finish", result)
+            blocked = run_action("read_page", {"url": "https://public.example"}, settings)
+            self.assertIn("Please finish", blocked)
+        self.assertEqual(state["searches"], 6)
+        self.assertEqual(state["pages_read"], 8)
+
+    def test_research_batch_requires_search_or_read_as_last_action(self):
+        client = FakeClient([plan_reply(), batch_response([item("web_search", {"query": "facts"}), item("wait")]),
+                             response("finish", 1, {"message": "done"})])
+        events = self.invoke(client)
+        self.assertTrue(any(e["type"] == "warning" and "web_search and read_page must be the last" in e["text"]
+                            for e in events))
+        self.assertFalse(any(e["type"] == "search" for e in events))
+
+    def test_notes_create_markdown_report_and_report_events(self):
+        source = "https://example.org/research"
+        client = FakeClient([plan_reply(), response("save_note", 1,
+                             {"text": "A sourced and verified finding.", "source": source}),
+                             response("finish", 1, {"message": "Research answer."})])
+        events = []
+        settings = {"model": "offline-test", "client": client, "sleep": lambda _seconds: None}
+        with tempfile.TemporaryDirectory() as report_dir, patch.object(engine, "REPORTS_DIR", report_dir):
+            run_task("research something", settings, events.append, threading.Event())
+            summary = events[-1]
+            self.assertTrue(os.path.isfile(summary["report_path"]))
+            with open(summary["report_path"], encoding="utf-8") as report_file:
+                report = report_file.read()
+        self.assertIn("# Complete the desktop task", report)
+        self.assertIn("Research answer.", report)
+        self.assertIn("A sourced and verified finding. [1]", report)
+        self.assertIn("1. <https://example.org/research>", report)
+        self.assertEqual(summary["notes_saved"], 1)
+        self.assertEqual(summary["searches"], 0)
+        self.assertEqual(summary["pages_read"], 0)
+        self.assertTrue(any(e["type"] == "note_saved" for e in events))
+        self.assertTrue(any(e["type"] == "report_saved" for e in events))
 
 
 if __name__ == "__main__":
