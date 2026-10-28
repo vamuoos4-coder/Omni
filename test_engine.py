@@ -12,7 +12,8 @@ from datetime import datetime
 from unittest.mock import patch
 
 import engine
-from engine import run_action, run_task
+from engine import (finish_step_states, run_action, run_task,
+                    transition_step_states)
 
 
 class FakeResponse:
@@ -60,6 +61,155 @@ def item(action, args=None, step=1):
     return {"action": action, "args": args or {}, "step": step}
 
 
+class FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def monotonic(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class ModelProgressTests(unittest.TestCase):
+    def test_heartbeat_reports_elapsed_time_and_stops_when_call_returns(self):
+        clock = FakeClock()
+        ready = threading.Event()
+        monitor_stopped = threading.Event()
+        events = []
+
+        class WaitingClient:
+            def __init__(self):
+                self.chat = types.SimpleNamespace(completions=self)
+
+            def create(self, **_kwargs):
+                ready.wait()
+                return FakeResponse("ok")
+
+        def driver(finished, stop_event, pulse, _clock, _started, interval):
+            for _ in range(3):
+                if finished.is_set() or (stop_event is not None and stop_event.is_set()):
+                    break
+                clock.advance(interval)
+                pulse()
+            ready.set()
+            finished.wait()
+            monitor_stopped.set()
+
+        response_obj = engine._call_model(
+            WaitingClient(), {"model": "offline", "_clock": clock.monotonic,
+                              "_heartbeat_interval": 5, "_heartbeat_driver": driver},
+            [], "plan", emit_log=events.append)
+        self.assertEqual(response_obj.choices[0].message.content, "ok")
+        self.assertTrue(monitor_stopped.is_set())
+        self.assertEqual([line for line in events if "still waiting" in line], [
+            "...still waiting for the model (5s)",
+            "...still waiting for the model (10s)",
+            "...still waiting for the model (15s)",
+        ])
+        self.assertEqual(events[-1], "Model replied in 15.0s")
+        self.assertEqual(sum("still waiting" in line for line in events[events.index(events[-1]) + 1:]), 0)
+
+    def test_heartbeat_stops_when_stop_event_is_set(self):
+        clock = FakeClock()
+        ready = threading.Event()
+        stop = threading.Event()
+        events = []
+        stopped = threading.Event()
+
+        class WaitingClient:
+            def __init__(self):
+                self.chat = types.SimpleNamespace(completions=self)
+
+            def create(self, **_kwargs):
+                ready.wait()
+                return FakeResponse("ok")
+
+        def driver(finished, stop_event, pulse, _clock, _started, interval):
+            clock.advance(interval)
+            pulse()
+            stop_event.set()
+            ready.set()
+            stopped.set()
+
+        engine._call_model(WaitingClient(), {"model": "offline", "_clock": clock.monotonic,
+                                              "_heartbeat_interval": 5,
+                                              "_heartbeat_driver": driver}, [], "screen-first plan",
+                           stop_event=stop, emit_log=events.append)
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(sum("still waiting" in line for line in events), 1)
+        self.assertEqual(events[-1], "Model replied in 5.0s")
+
+    def test_timeout_is_warned_and_exception_is_preserved(self):
+        events = []
+        warnings = []
+
+        class TimedOutClient:
+            def __init__(self):
+                self.chat = types.SimpleNamespace(completions=self)
+
+            def create(self, **_kwargs):
+                raise TimeoutError("request timed out")
+
+        with self.assertRaises(TimeoutError):
+            engine._call_model(TimedOutClient(), {"model": "offline", "_clock": lambda: 3.0},
+                               [], "re-plan", emit_log=events.append,
+                               on_timeout=warnings.append)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("timed out", warnings[0])
+        self.assertIn("90s", warnings[0])
+        self.assertIn("Model call failed after", events[-1])
+
+    def test_openai_client_uses_ninety_second_timeout(self):
+        constructed = {}
+
+        class OpenAIStub:
+            def __init__(self, **kwargs):
+                constructed.update(kwargs)
+
+        openai_module = types.ModuleType("openai")
+        openai_module.OpenAI = OpenAIStub
+        with patch.dict(sys.modules, {"openai": openai_module}):
+            engine._client_for({"base": "", "key": "test"})
+        self.assertEqual(constructed["timeout"], 90)
+
+
+class ChecklistStateTests(unittest.TestCase):
+    def test_in_order_and_skipped_transitions_mark_earlier_steps_done(self):
+        states = {1: "pending", 2: "pending", 3: "pending", 4: "pending"}
+        states, active, furthest = transition_step_states(states, None, None, 1)
+        self.assertEqual((states, active, furthest),
+                         ({1: "running", 2: "pending", 3: "pending", 4: "pending"}, 1, 1))
+        states, active, furthest = transition_step_states(states, active, furthest, 2)
+        self.assertEqual(states[1], "done")
+        self.assertEqual(states[2], "running")
+        states, active, furthest = transition_step_states(states, active, furthest, 4)
+        self.assertEqual([states[i] for i in range(1, 5)], ["done", "done", "done", "running"])
+
+    def test_repeated_out_of_order_and_missing_ids_are_safe(self):
+        states = {1: "pending", 2: "pending", 3: "pending"}
+        states, active, furthest = transition_step_states(states, None, None, 2)
+        self.assertEqual(states[1], "done")
+        states, active, furthest = transition_step_states(states, active, furthest, 2)
+        self.assertEqual(states[2], "running")
+        states, active, furthest = transition_step_states(states, active, furthest, 3)
+        states, active, furthest = transition_step_states(states, active, furthest, 1)
+        self.assertEqual(states, {1: "running", 2: "done", 3: "pending"})
+        before = (dict(states), active, furthest)
+        result = transition_step_states(states, active, furthest, 99)
+        self.assertEqual(result, before)
+        self.assertEqual(transition_step_states(states, active, furthest, None), before)
+        self.assertEqual(transition_step_states(states, active, furthest, [1]), before)
+
+    def test_finish_marks_all_done_but_stop_or_failure_keeps_pending(self):
+        states = {1: "done", 2: "running", 3: "pending"}
+        self.assertEqual(finish_step_states(states, True),
+                         {1: "done", 2: "done", 3: "done"})
+        self.assertEqual(finish_step_states(states, False),
+                         {1: "done", 2: "pending", 3: "pending"})
+
+
 class EngineTests(unittest.TestCase):
     def invoke(self, client, action_runner=None, stop=None, settings_extra=None):
         events = []
@@ -76,7 +226,13 @@ class EngineTests(unittest.TestCase):
                              response("finish", 2, {"message": "Typed hello."})])
         actions = []
         events = self.invoke(client, lambda action, args, settings: actions.append((action, args)) or "ok")
-        self.assertEqual(events[0]["type"], "thought")
+        self.assertEqual(events[0]["type"], "log")
+        self.assertEqual(events[0]["text"], "Starting task...")
+        self.assertEqual(events[1]["type"], "log")
+        self.assertEqual(events[1]["text"], "Planning...")
+        log_texts = [event["text"] for event in events if event["type"] == "log"]
+        self.assertEqual(log_texts[:3], ["Starting task...", "Planning...", "Calling model: plan"])
+        self.assertTrue(any(text.startswith("Model replied in ") for text in log_texts))
         plan_event = next(event for event in events if event["type"] == "plan")
         self.assertEqual(plan_event["goal"], "Complete the desktop task")
         self.assertIn("Plan", client.calls[1]["messages"][1]["content"])
@@ -84,6 +240,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([e["step_id"] for e in events if e["type"] == "step_done"], [1, 2])
         self.assertEqual(len(actions), 2)
         self.assertEqual(events[-1]["steps_completed"], 2)
+        self.assertTrue(events[-1]["finished_by_finish"])
+
+    def test_model_timeout_warns_and_uses_existing_planner_fallback(self):
+        client = FakeClient([TimeoutError("request timed out"),
+                             response("finish", args={"message": "done"})])
+        events = self.invoke(client)
+        warnings = [event["text"] for event in events if event["type"] == "warning"]
+        self.assertTrue(any("Model call timed out" in text and "90s" in text for text in warnings))
+        self.assertTrue(any("continuing without a plan" in text for text in warnings))
+        self.assertEqual(events[-1]["api_calls"], 2)
+
+    def test_unknown_skill_warning_is_emitted_to_task_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            events = []
+            client = FakeClient([plan_reply(), response("finish", args={"message": "done"})])
+            settings = {"model": "offline-test", "client": client, "skills_dir": folder,
+                       "sleep": lambda _seconds: None}
+            run_task("@missing open notepad", settings, events.append, threading.Event())
+        warnings = [event["text"] for event in events if event["type"] == "warning"]
+        self.assertTrue(any("Unknown skill @missing" in warning for warning in warnings))
 
     def test_invalid_plan_retries_once_then_falls_back(self):
         client = FakeClient(["not json", '{"goal":"bad","steps":[]}', response("finish", args={"message": "done"})])
@@ -103,6 +279,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
         self.assertEqual(events[-1]["type"], "summary")
         self.assertEqual(events[-1]["api_calls"], 0)
+        self.assertFalse(events[-1]["finished_by_finish"])
         self.assertIn("Stopped", events[-1]["outcome"])
 
     def test_stop_event_after_action_stops_next_iteration(self):
@@ -261,6 +438,9 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(events[-1]["vision_used"], "yes")
         self.assertEqual(events[-1]["total_api_calls"], 2)
         self.assertTrue(any(event["type"] == "screen" and "blank notepad" in event["text"] for event in events))
+        self.assertTrue(any(event["type"] == "log" and
+                            event.get("text") == "Calling model: step 1 (vision)"
+                            for event in events))
         self.assertIn("one short sentence", client.calls[1]["messages"][0]["content"])
         self.assertEqual(save_mock.call_args_list[0].args[2], 1)
 
@@ -313,6 +493,9 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Based on the current screen", plan_event["note"])
         self.assertEqual(plan_event["goal"], "Dismiss the visible dialog")
         self.assertTrue(any(event["type"] == "screen" and "confirmation dialog" in event["text"]
+                            for event in events))
+        self.assertTrue(any(event["type"] == "log" and
+                            event.get("text") == "Calling model: screen-first plan (vision)"
                             for event in events))
         self.assertEqual(events[-1]["vision_used"], "yes")
         self.assertEqual(events[-1]["api_calls"], 3)
@@ -413,6 +596,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([step["id"] for step in request["completed_steps"]], [1])
         self.assertEqual(request["next_step_id"], 2)
         event = next(event for event in events if event["type"] == "replan")
+        self.assertTrue(any(item["type"] == "log" and item.get("text") == "Calling model: re-plan 1"
+                            for item in events))
         self.assertEqual([step["id"] for step in event["steps"]], [1, 2, 3])
         self.assertEqual(event["completed_ids"], [1])
         self.assertEqual(events[-1]["replans"], 1)
@@ -561,9 +746,12 @@ class SkillTests(unittest.TestCase):
                      "trace": [{"action": "type_text", "args": {"text": "hello"}, "result": "typed"}],
                      "hints": ["Wait after opening the editor."]}
         client = FakeClient([json.dumps(extracted)])
+        logs = []
         result = engine.extract_skill({"original_task": "write hello", "goal": "create note",
                                       "steps": ["Open editor"], "trace": [], "needs_vision": False},
-                                     {"client": client, "model": "fake"})
+                                     {"client": client, "model": "fake", "_emit_log": logs.append})
+        self.assertTrue(logs[0].startswith("Calling model: skill extractor"))
+        self.assertTrue(logs[-1].startswith("Model replied in "))
         self.assertEqual(result["description"], extracted["description"])
         self.assertEqual(result["trace"][0]["args"]["text"], "{content}")
         self.assertEqual(len(client.calls), 1)
@@ -871,7 +1059,11 @@ class ImprovePromptTests(unittest.TestCase):
     def test_valid_json_uses_exactly_one_text_only_call(self):
         payload = json.dumps({"improved": "Please save the document.", "changes": "Corrected grammar and clarified the wording."})
         client = FakeClient([payload])
-        result = engine.improve_prompt("pls save doc", {"model": "offline", "client": client, "vision": True})
+        logs = []
+        result = engine.improve_prompt("pls save doc", {"model": "offline", "client": client,
+                                                           "vision": True, "_emit_log": logs.append})
+        self.assertTrue(logs[0].startswith("Calling model: improve"))
+        self.assertTrue(logs[-1].startswith("Model replied in "))
         self.assertEqual(result["improved"], "Please save the document.")
         self.assertEqual(result["changes"], "Corrected grammar and clarified the wording.")
         self.assertEqual(len(client.calls), 1)

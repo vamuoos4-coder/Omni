@@ -11,7 +11,7 @@ from engine import (REPORTS_DIR, SCREENSHOTS_DIR, SKILLS_DIR, cleanup_screenshot
                     clear_screenshot_folders, delete_skill, extract_skill, improve_prompt,
                     list_skills, load_skill, migrate_vision_mode, open_report_in_notepad,
                     redact_skill_secrets, run_task, save_skill, skill_exists, suggest_skill_name,
-                    validate_skill_name)
+                    transition_step_states, finish_step_states, validate_skill_name)
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -29,6 +29,9 @@ class App:
         root.geometry("660x640")
         self.stop = threading.Event()
         self.plan_rows = {}
+        self.step_states = {}
+        self.active_step_id = None
+        self.furthest_step_id = None
         self.latest_report_path = ""
         self._skill_candidate = None
         self._skills_window = None
@@ -118,13 +121,20 @@ class App:
         return e
 
     def _append(self, timestamp, text):
-        for line in str(text).splitlines() or [""]:
-            self.log.insert("end", f"{timestamp}  {line}\n")
-        self.log.see("end")
+        self.log.configure(state="normal")
+        try:
+            for line in str(text).splitlines() or [""]:
+                self.log.insert("end", f"{timestamp}  {line}\n")
+            self.log.see("end")
+        finally:
+            self.log.configure(state="disabled")
 
     def emit(self, event):
         """Queue engine events onto Tk's main thread; engine never touches widgets."""
         self.root.after(0, self._render_event, event)
+
+    def _emit_model_log(self, text):
+        self.emit({"type": "log", "time": "", "text": text})
 
     def _render_plan_checklist(self, goal, steps, completed_ids=(), note=""):
         self.current_steps = steps
@@ -133,9 +143,15 @@ class App:
             child.destroy()
         self.plan_rows.clear()
         completed_ids = set(completed_ids)
+        self.step_states = {step.get("id"): ("done" if step.get("id") in completed_ids else "pending")
+                            for step in steps}
+        self.active_step_id = None
+        numeric_completed = [step_id for step_id in completed_ids
+                             if isinstance(step_id, int) and not isinstance(step_id, bool)]
+        self.furthest_step_id = max(numeric_completed, default=None)
         for step in steps:
             sid = step.get("id")
-            marker = "✓" if sid in completed_ids else "○"
+            marker = {"pending": "○", "running": "▶", "done": "✓"}[self.step_states[sid]]
             label = tk.Label(self.plan_list, text=f"{marker}  {step.get('title', '')}", anchor="w")
             label.pack(fill="x")
             self.plan_rows[sid] = label
@@ -143,6 +159,9 @@ class App:
     def _render_event(self, event):
         kind = event.get("type", "event")
         stamp = event.get("time") or datetime.now().astimezone().isoformat(timespec="seconds")
+        if kind == "log":
+            self._append(stamp, event.get("text", ""))
+            return
         if kind == "plan":
             note = event.get("note", "") if event.get("based_on_screen") else ""
             self._render_plan_checklist(event.get("goal", ""), event.get("steps", []), note=note)
@@ -213,6 +232,7 @@ class App:
                 self.plan_goal.configure(text="No plan (continuing without one)")
             self._append(stamp, kind.upper() + ": " + event.get("text", ""))
         elif kind == "summary":
+            self._finalize_checklist(event.get("finished_by_finish", False))
             self._append(stamp, "Summary: Goal: " + event.get("goal", "") + " | Outcome: " + event.get("outcome", "") +
                          f" | Steps {event.get('steps_completed', 0)}/{event.get('steps_total', 0)}" +
                          f" | Actions {event.get('actions_executed', 0)}" +
@@ -230,14 +250,38 @@ class App:
             if self._skills_window and self._skills_window.winfo_exists():
                 self._refresh_skills_tree()
 
-    def _set_step(self, step_id, state):
+    def _paint_step(self, step_id):
         label = self.plan_rows.get(step_id)
         if not label:
             return
         step = next((item for item in getattr(self, "current_steps", []) if item.get("id") == step_id), None)
         title = step.get("title", "") if step else label.cget("text").split("  ", 1)[-1]
-        marker = {"pending": "○", "running": "▶", "done": "✓"}[state]
+        marker = {"pending": "○", "running": "▶", "done": "✓"}.get(
+            self.step_states.get(step_id, "pending"), "○")
         label.configure(text=f"{marker}  {title}")
+
+    def _set_step(self, step_id, state):
+        if isinstance(step_id, bool) or not isinstance(step_id, int):
+            return
+        if state == "running":
+            (self.step_states, self.active_step_id,
+             self.furthest_step_id) = transition_step_states(
+                 self.step_states, self.active_step_id, self.furthest_step_id, step_id)
+            for current_id in self.plan_rows:
+                self._paint_step(current_id)
+            return
+        if step_id not in self.plan_rows:
+            return
+        self.step_states[step_id] = state
+        if state == "done" and self.active_step_id == step_id:
+            self.active_step_id = None
+        self._paint_step(step_id)
+
+    def _finalize_checklist(self, finished_by_finish):
+        self.step_states = finish_step_states(self.step_states, finished_by_finish)
+        self.active_step_id = None
+        for step_id in self.plan_rows:
+            self._paint_step(step_id)
 
     def _task_text(self):
         return self.task.get("1.0", "end-1c")
@@ -274,7 +318,8 @@ class App:
         if not original.strip() or self._improving:
             return
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
-                    "model": self.model.get().strip()}
+                    "model": self.model.get().strip(), "_emit_log": self._emit_model_log,
+                    "_emit_timeout": lambda text: self.emit({"type": "warning", "time": "", "text": text})}
         self._improving = True
         self.improve_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled")
@@ -342,7 +387,8 @@ class App:
             return
         self.save_skill_btn.configure(state="disabled")
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
-                    "model": self.model.get().strip()}
+                    "model": self.model.get().strip(), "_emit_log": self._emit_model_log,
+                    "_emit_timeout": lambda text: self.emit({"type": "warning", "time": "", "text": text})}
 
         def worker():
             try:
@@ -582,6 +628,13 @@ class App:
                        "text": f"Could not open reports folder: {exc}"})
 
     def start(self):
+        task = self.task.get("1.0", "end").strip()
+        if not task or not self.model.get().strip():
+            self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
+            return
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._append(stamp, "Starting task...")
+        self._append(stamp, "Planning...")
         if self.remember.get():
             with open(CONFIG, "w", encoding="utf-8") as f:
                 json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
@@ -590,10 +643,6 @@ class App:
                            "open_report_notepad": self.open_report_notepad.get()}, f)
         elif os.path.exists(CONFIG):
             os.remove(CONFIG)
-        task = self.task.get("1.0", "end").strip()
-        if not task or not self.model.get().strip():
-            self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
-            return
         self._clear_undo()
         self._skill_candidate = None
         self.save_skill_btn.configure(state="disabled")
@@ -608,7 +657,8 @@ class App:
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
                     "model": self.model.get().strip(), "browser": self.browser.get().strip(),
                     "vision_mode": self.vision_mode.get(), "batch_actions": self.batch_actions.get(),
-                    "open_report_notepad": self.open_report_notepad.get()}
+                    "open_report_notepad": self.open_report_notepad.get(),
+                    "initial_logs_emitted": True}
         if settings["vision_mode"] == "on":
             self.root.iconify()
         threading.Thread(target=self._run, args=(task, settings), daemon=True).start()

@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -18,7 +19,36 @@ from urllib.parse import quote_plus, urljoin, urlsplit
 
 MAX_STEPS = 15
 MAX_STEPS_VISION = 25
+MODEL_TIMEOUT_SECONDS = 90
+MODEL_HEARTBEAT_SECONDS = 5
 COLS, ROWS = 16, 9
+
+
+def transition_step_states(states, active_step_id, furthest_step_id, new_step_id):
+    """Apply a resilient checklist start transition and return states/current/furthest IDs."""
+    updated = dict(states)
+    if isinstance(new_step_id, bool) or not isinstance(new_step_id, int) or new_step_id not in updated:
+        return updated, active_step_id, furthest_step_id
+    if furthest_step_id is None or new_step_id > furthest_step_id:
+        for step_id in updated:
+            if isinstance(step_id, int) and not isinstance(step_id, bool) and step_id < new_step_id:
+                updated[step_id] = "done"
+        furthest_step_id = new_step_id
+    if active_step_id is not None and active_step_id != new_step_id:
+        if updated.get(active_step_id) == "running":
+            updated[active_step_id] = "done" if new_step_id > active_step_id else "pending"
+    updated[new_step_id] = "running"
+    return updated, new_step_id, furthest_step_id
+
+
+def finish_step_states(states, finished_by_finish):
+    """Finalize checklist states without marking unfinished work done on failure/stop."""
+    if finished_by_finish:
+        return {step_id: "done" for step_id in states}
+    return {step_id: ("pending" if state == "running" else state)
+            for step_id, state in states.items()}
+
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(APP_DIR, "reports")
 SCREENSHOTS_DIR = os.path.join(APP_DIR, "screenshots")
@@ -547,8 +577,9 @@ def extract_skill(candidate, settings):
     last_error = None
     for attempt in range(2):
         try:
-            response = client.chat.completions.create(model=settings.get("model", ""),
-                                                      messages=messages, temperature=0)
+            response = _call_model(client, settings, messages, "skill extractor",
+                                   emit_log=settings.get("_emit_log"),
+                                   on_timeout=settings.get("_emit_timeout"))
             value = json.loads(_content(response).strip())
             result = _validate_extraction(value)
             result, _ = redact_skill_secrets(result)
@@ -1107,11 +1138,93 @@ def _client_for(settings):
         return client
     from openai import OpenAI
     return OpenAI(base_url=settings.get("base", "").strip() or None,
-                  api_key=settings.get("key", "").strip() or "none")
+                  api_key=settings.get("key", "").strip() or "none",
+                  timeout=MODEL_TIMEOUT_SECONDS)
 
 
 def _content(response):
     return response.choices[0].message.content or ""
+
+
+def _is_timeout_error(exc):
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    return "timeout" in name or "timed out" in message or "timeout" in message
+
+
+def _call_model(client, settings, messages, purpose, stop_event=None, emit_log=None, on_timeout=None):
+    """Call the model with bounded client timeout, progress logging, and a cancellable heartbeat."""
+    settings = settings or {}
+    logger = emit_log or settings.get("_emit_log")
+    timeout_handler = on_timeout or settings.get("_emit_timeout")
+    clock = settings.get("_clock", time.monotonic)
+    started = clock()
+    finished = threading.Event()
+    interval = max(0.1, float(settings.get("_heartbeat_interval", MODEL_HEARTBEAT_SECONDS)))
+
+    def log_line(line):
+        if logger:
+            try:
+                logger(str(line))
+            except Exception:
+                pass
+
+    log_line(f"Calling model: {purpose}")
+
+    def pulse():
+        if finished.is_set() or (stop_event is not None and stop_event.is_set()):
+            return
+        elapsed = max(0.0, clock() - started)
+        log_line(f"...still waiting for the model ({elapsed:.0f}s)")
+
+    def heartbeat_worker():
+        try:
+            test_driver = settings.get("_heartbeat_driver")
+            if test_driver:
+                test_driver(finished, stop_event, pulse, clock, started, interval)
+                return
+            next_beat = started + interval
+            while not finished.is_set() and not (stop_event is not None and stop_event.is_set()):
+                if finished.wait(min(0.1, interval)):
+                    return
+                if stop_event is not None and stop_event.is_set():
+                    return
+                now = clock()
+                if now >= next_beat:
+                    pulse()
+                    next_beat += interval
+        except Exception:
+            # The monitor is advisory; it must never interfere with task execution.
+            return
+
+    monitor = threading.Thread(target=heartbeat_worker, name="model-heartbeat", daemon=True)
+    monitor.start()
+    try:
+        response = client.chat.completions.create(model=settings.get("model", ""),
+                                                  messages=messages, temperature=0)
+    except Exception as exc:
+        finished.set()
+        elapsed = max(0.0, clock() - started)
+        if _is_timeout_error(exc):
+            warning = (f"Model call timed out after {elapsed:.1f}s (client timeout: "
+                       f"{MODEL_TIMEOUT_SECONDS}s).")
+            if timeout_handler:
+                try:
+                    timeout_handler(warning)
+                except Exception:
+                    log_line("WARNING: " + warning)
+            else:
+                log_line("WARNING: " + warning)
+        log_line(f"Model call failed after {elapsed:.1f}s")
+        raise
+    else:
+        finished.set()
+        elapsed = max(0.0, clock() - started)
+        log_line(f"Model replied in {elapsed:.1f}s")
+        return response
+    finally:
+        finished.set()
+        monitor.join(timeout=0.25)
 
 
 def improve_prompt(text, settings):
@@ -1121,11 +1234,11 @@ def improve_prompt(text, settings):
         return None
     settings = dict(settings or {})
     client = _client_for(settings)
-    response = client.chat.completions.create(
-        model=settings.get("model", ""),
-        messages=[{"role": "system", "content": IMPROVE_SYSTEM},
-                  {"role": "user", "content": original}],
-        temperature=0)
+    response = _call_model(client, settings,
+                           [{"role": "system", "content": IMPROVE_SYSTEM},
+                            {"role": "user", "content": original}],
+                           "improve", emit_log=settings.get("_emit_log"),
+                           on_timeout=settings.get("_emit_timeout"))
     try:
         value = json.loads(_content(response).strip())
     except Exception as exc:
@@ -1267,6 +1380,11 @@ def run_task(task, settings, emit, stop_event):
     settings["_research_state"] = research_state
     settings["_emit_event"] = send
 
+    def call_model(purpose, messages):
+        return _call_model(client, settings, messages, purpose, stop_event=stop_event,
+                           emit_log=lambda line: send("log", text=line),
+                           on_timeout=lambda warning: send("warning", text=warning))
+
     def action_system(use_vision):
         system = _action_system(plan, use_vision, batching_requested and not use_vision, mode)
         return system + (SKILL_SAFETY_ADDON if skill_guidance else "")
@@ -1321,7 +1439,9 @@ def run_task(task, settings, emit, stop_event):
         return step_id
 
     try:
-        send("thought", text=f"Starting task: {task}")
+        if not settings.get("initial_logs_emitted"):
+            send("log", text="Starting task...")
+            send("log", text="Planning...")
         for warning in skill_warnings:
             send("warning", text=warning)
         if active_skill:
@@ -1352,8 +1472,7 @@ def run_task(task, settings, emit, stop_event):
                 return
             try:
                 api_calls += 1
-                response = client.chat.completions.create(model=settings.get("model", ""),
-                                                          messages=planner_messages, temperature=0)
+                response = call_model("plan" if attempt == 0 else "plan retry", planner_messages)
                 plan = parse_plan(_content(response))
                 break
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1388,8 +1507,7 @@ def run_task(task, settings, emit, stop_event):
                 ]
                 try:
                     api_calls += 1
-                    response = client.chat.completions.create(model=settings.get("model", ""),
-                                                              messages=visual_planner_messages, temperature=0)
+                    response = call_model("screen-first plan (vision)", visual_planner_messages)
                     screen_plan = parse_plan(_content(response))
                     plan = screen_plan
                     based_on_screen = True
@@ -1479,8 +1597,8 @@ def run_task(task, settings, emit, stop_event):
                     send("warning", text=f"Could not capture a screen for re-planning: {' '.join(str(exc).split())[:120]}")
             try:
                 api_calls += 1
-                response = client.chat.completions.create(model=settings.get("model", ""),
-                                                          messages=request_messages, temperature=0)
+                response = call_model(f"re-plan {replan_count}" + (" (vision)" if vision else ""),
+                                      request_messages)
                 replan_text = _content(response)
                 if vision:
                     parsed_replan = json.loads(replan_text.strip())
@@ -1537,8 +1655,8 @@ def run_task(task, settings, emit, stop_event):
                 ]}]
             try:
                 api_calls += 1
-                response = client.chat.completions.create(model=settings.get("model", ""),
-                                                          messages=call_msgs, temperature=0)
+                response = call_model(f"step {action_index}" + (" (vision)" if vision else ""),
+                                      call_msgs)
                 text = _content(response)
             except Exception as exc:
                 if vision and _image_unsupported(exc):
@@ -1831,5 +1949,6 @@ def run_task(task, settings, emit, stop_event):
              searches=research_state["searches"], pages_read=research_state["pages_read"],
              notes_saved=len(research_state["notes"]), report_path=report_path,
              vision_used=vision_summary, replans=replan_count, skill_name=skill_name,
+             finished_by_finish=finished_by_finish,
              seconds=round(time.monotonic() - started, 2),
              outcome=" ".join(str(outcome).split()))
