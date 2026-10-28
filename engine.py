@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -19,6 +20,7 @@ MAX_STEPS_VISION = 25
 COLS, ROWS = 16, 9
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(APP_DIR, "reports")
+SCREENSHOTS_DIR = os.path.join(APP_DIR, "screenshots")
 MAX_SEARCHES = 6
 MAX_PAGE_READS = 8
 MAX_PAGE_BYTES = 2 * 1024 * 1024
@@ -95,6 +97,9 @@ PLANNER_SYSTEM = """You are a task planner for a Windows desktop automation agen
 Make 3 to 8 short, actionable steps. Use consecutive integer ids starting at 1. For research tasks,
 plan the steps in this order: search, read the best sources, take notes with source URLs, write the report."""
 
+IMPROVE_SYSTEM = """Fix spelling and grammar and make the wording clearer. Keep the exact meaning and the same language. Never add actions, steps, facts, or requirements the user did not ask for. Return ONLY valid JSON, with no markdown or extra text, in exactly this shape:
+{"improved":"...","changes":"one short sentence"}"""
+
 
 def _now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -162,6 +167,117 @@ def _pyautogui():
     import pyautogui
     pyautogui.FAILSAFE = True  # preserve the corner emergency stop
     return pyautogui
+
+
+def safe_task_slug(task):
+    text = str(task).encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:30].strip("-")
+    return slug or "task"
+
+
+def create_screenshot_task_dir(task, root=None, now=None):
+    root = root or SCREENSHOTS_DIR
+    now = now or datetime.now()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    slug = safe_task_slug(task)
+    candidate_slug = slug
+    suffix = 1
+    while True:
+        path = os.path.join(root, f"{stamp}-{candidate_slug}")
+        try:
+            os.makedirs(path, exist_ok=False)
+            return path
+        except FileExistsError:
+            suffix += 1
+            ending = f"-{suffix}"
+            candidate_slug = slug[:30 - len(ending)].rstrip("-") + ending
+
+
+def save_screenshot(image_b64, task_dir, step_number):
+    image_bytes = base64.b64decode(image_b64)
+    os.makedirs(task_dir, exist_ok=True)
+    path = os.path.join(task_dir, f"step-{step_number:02d}.jpg")
+    with open(path, "wb") as screenshot_file:
+        screenshot_file.write(image_bytes)
+    return path
+
+
+def _click_marker_image(image_bytes, args):
+    match = re.fullmatch(r"([A-Pa-p])([1-9])", str(args.get("cell", "")).strip())
+    if not match:
+        return None
+    try:
+        dx = min(max(float(args.get("dx", 0.5)), 0.0), 1.0)
+        dy = min(max(float(args.get("dy", 0.5)), 0.0), 1.0)
+    except (TypeError, ValueError):
+        return None
+    from PIL import Image, ImageDraw
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    col = ord(match.group(1).upper()) - ord("A")
+    row = int(match.group(2)) - 1
+    x = min(max(int((col + dx) / COLS * width), 0), width - 1)
+    y = min(max(int((row + dy) / ROWS * height), 0), height - 1)
+    draw = ImageDraw.Draw(image)
+    radius = max(8, min(width, height) // 45)
+    draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(255, 0, 0), width=4)
+    draw.line((x - radius, y, x + radius, y), fill=(255, 0, 0), width=3)
+    draw.line((x, y - radius, x, y + radius), fill=(255, 0, 0), width=3)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=90)
+    return output.getvalue()
+
+
+def save_click_marker(image_b64, task_dir, step_number, args):
+    image_bytes = base64.b64decode(image_b64)
+    marked = _click_marker_image(image_bytes, args)
+    if marked is None:
+        return None
+    os.makedirs(task_dir, exist_ok=True)
+    path = os.path.join(task_dir, f"step-{step_number:02d}-click.jpg")
+    with open(path, "wb") as marker_file:
+        marker_file.write(marked)
+    return path
+
+
+def cleanup_screenshot_folders(root=None, now=None):
+    """Remove task folders whose last modification is more than seven days old."""
+    root = root or SCREENSHOTS_DIR
+    if not os.path.isdir(root):
+        return []
+    cutoff = (now or time.time()) - 7 * 24 * 60 * 60
+    removed = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return removed
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path)
+                removed.append(path)
+        except OSError:
+            continue
+    return removed
+
+
+def clear_screenshot_folders(root=None):
+    root = root or SCREENSHOTS_DIR
+    removed = []
+    if not os.path.isdir(root):
+        return removed
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+                removed.append(path)
+            elif os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            continue
+    return removed
 
 
 def grab():
@@ -532,6 +648,44 @@ def _content(response):
     return response.choices[0].message.content or ""
 
 
+def improve_prompt(text, settings):
+    """Improve task wording in one text-only model call; return None for empty input."""
+    original = str(text or "")
+    if not original.strip():
+        return None
+    settings = dict(settings or {})
+    client = _client_for(settings)
+    response = client.chat.completions.create(
+        model=settings.get("model", ""),
+        messages=[{"role": "system", "content": IMPROVE_SYSTEM},
+                  {"role": "user", "content": original}],
+        temperature=0)
+    try:
+        value = json.loads(_content(response).strip())
+    except Exception as exc:
+        raise ValueError("The model returned invalid JSON.") from exc
+    if (not isinstance(value, dict) or not isinstance(value.get("improved"), str)
+            or not value["improved"].strip() or not isinstance(value.get("changes"), str)
+            or not value["changes"].strip()):
+        raise ValueError("The model response is missing improved text or a change summary.")
+    return {"improved": value["improved"], "changes": value["changes"]}
+
+
+def open_report_in_notepad(report_path):
+    """Open a Markdown report in Notepad, falling back to the system file handler."""
+    report_path = os.fspath(report_path)
+    try:
+        subprocess.Popen(["notepad.exe", report_path])
+        return ""
+    except Exception as exc:
+        warning = f"Notepad could not open the report ({str(exc)[:120]}); trying the default app."
+        try:
+            os.startfile(report_path)
+        except Exception as fallback_exc:
+            return f"{warning} The fallback also failed: {str(fallback_exc)[:120]}"
+        return warning
+
+
 def _action_failed(result):
     if result is False:
         return True
@@ -613,6 +767,7 @@ def run_task(task, settings, emit, stop_event):
                       "research_started": False, "answer": ""}
     settings["_emit_event"] = send
     report_path = ""
+    screenshot_task_dir = None
 
     def complete_step(step_id):
         if step_id is not None and step_id not in completed:
@@ -698,8 +853,17 @@ def run_task(task, settings, emit, stop_event):
                 loop_ended = True
                 break
             call_msgs = msgs
+            current_screenshot_b64 = None
             if vision:
                 b64 = grab()
+                current_screenshot_b64 = b64
+                try:
+                    if screenshot_task_dir is None:
+                        screenshot_task_dir = create_screenshot_task_dir(task)
+                    screenshot_path = save_screenshot(b64, screenshot_task_dir, action_index)
+                    send("screenshot_saved", file_path=screenshot_path)
+                except Exception as exc:
+                    send("warning", text=f"Could not save screenshot: {' '.join(str(exc).split())[:120]}")
                 call_msgs = msgs[:-1] + [{"role": "user", "content": [
                     {"type": "text", "text": msgs[-1]["content"] + "\n(Latest screenshot with grid attached.)"},
                     {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}},
@@ -767,6 +931,15 @@ def run_task(task, settings, emit, stop_event):
                     break
 
                 step_id = start_step(item)
+                if (vision and current_screenshot_b64 and screenshot_task_dir
+                        and action in ("click", "double_click", "right_click")):
+                    try:
+                        marker_path = save_click_marker(current_screenshot_b64, screenshot_task_dir,
+                                                        action_index, args)
+                        if marker_path:
+                            send("screenshot_saved", file_path=marker_path)
+                    except Exception as exc:
+                        send("warning", text=f"Could not save click marker: {' '.join(str(exc).split())[:120]}")
                 send("thought", text=str(data.get("thought", "")), step_id=step_id)
                 send("action", action=action, args=args, step_id=step_id)
                 actions_executed += 1
@@ -866,6 +1039,10 @@ def run_task(task, settings, emit, stop_event):
                     research_state.get("answer") or outcome,
                     research_state["notes"])
                 send("report_saved", file_path=report_path)
+                if settings.get("open_report_notepad", True):
+                    warning = open_report_in_notepad(report_path)
+                    if warning:
+                        send("warning", text=warning)
             except Exception as exc:
                 send("warning", text=f"Could not save research report: {' '.join(str(exc).split())[:160]}")
         total = len(plan["steps"]) if plan else 0

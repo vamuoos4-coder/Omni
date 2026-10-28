@@ -5,9 +5,10 @@ import os
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import scrolledtext
+from tkinter import messagebox, scrolledtext
 
-from engine import REPORTS_DIR, run_task
+from engine import (REPORTS_DIR, SCREENSHOTS_DIR, cleanup_screenshot_folders,
+                    clear_screenshot_folders, improve_prompt, open_report_in_notepad, run_task)
 
 try:  # make screen coordinates match real pixels on scaled displays
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -25,6 +26,14 @@ class App:
         root.geometry("660x640")
         self.stop = threading.Event()
         self.plan_rows = {}
+        self.latest_report_path = ""
+        self._undo_original = None
+        self._setting_task_text = False
+        self._improving = False
+        try:
+            cleanup_screenshot_folders()
+        except Exception:
+            pass
         cfg = {}
         if os.path.exists(CONFIG):
             try:
@@ -44,19 +53,37 @@ class App:
         self.batch_actions = tk.BooleanVar(value=cfg.get("batch_actions", True))
         tk.Checkbutton(root, text="Batch actions (faster, not used with vision)",
                        variable=self.batch_actions).pack(anchor="w", padx=10)
+        self.open_report_notepad = tk.BooleanVar(value=cfg.get("open_report_notepad", True))
+        tk.Checkbutton(root, text="Open report in Notepad when done",
+                       variable=self.open_report_notepad).pack(anchor="w", padx=10)
         self.remember = tk.BooleanVar(value=bool(cfg))
         tk.Checkbutton(root, text="Remember settings in config.json", variable=self.remember).pack(anchor="w", padx=10)
 
         tk.Label(root, text="Task (spelling mistakes are OK)").pack(anchor="w", padx=10)
-        self.task = tk.Text(root, height=4)
-        self.task.pack(fill="x", padx=10)
+        task_row = tk.Frame(root)
+        task_row.pack(fill="x", padx=10)
+        self.task = tk.Text(task_row, height=4)
+        self.task.pack(side="left", fill="x", expand=True)
+        task_buttons = tk.Frame(task_row)
+        task_buttons.pack(side="left", fill="y", padx=(6, 0))
+        self.improve_btn = tk.Button(task_buttons, text="Improve", command=self.improve_task)
+        self.improve_btn.pack(fill="x")
+        self.undo_btn = tk.Button(task_buttons, text="Undo", command=self.undo_improvement, state="disabled")
+        self.undo_btn.pack(fill="x", pady=(4, 0))
+        self.task.edit_modified(False)
+        self.task.bind("<<Modified>>", self._task_modified)
 
         bar = tk.Frame(root)
         bar.pack(fill="x", padx=10, pady=6)
         self.run_btn = tk.Button(bar, text="Run", width=12, command=self.start)
         self.run_btn.pack(side="left")
         tk.Button(bar, text="Stop", width=12, command=self.stop.set).pack(side="left", padx=6)
+        self.open_report_btn = tk.Button(bar, text="Open report in Notepad", command=self.open_latest_report,
+                                         state="disabled")
+        self.open_report_btn.pack(side="left", padx=6)
         tk.Button(bar, text="Open reports folder", command=self.open_reports_folder).pack(side="left", padx=6)
+        tk.Button(bar, text="Open screenshots folder", command=self.open_screenshots_folder).pack(side="left", padx=6)
+        tk.Button(bar, text="Clear screenshots", command=self.confirm_clear_screenshots).pack(side="left", padx=6)
         tk.Label(bar, text="Emergency stop: slam the mouse into a screen corner").pack(side="left", padx=8)
 
         self.plan_frame = tk.LabelFrame(root, text="Plan")
@@ -127,7 +154,11 @@ class App:
         elif kind == "note_saved":
             self._append(stamp, f"Note saved ({event.get('count', 0)}): {event.get('source', '')}")
         elif kind == "report_saved":
-            self._append(stamp, "Report saved: " + event.get("file_path", ""))
+            self.latest_report_path = event.get("file_path", "")
+            self.open_report_btn.configure(state="normal" if self.latest_report_path else "disabled")
+            self._append(stamp, "Report saved: " + self.latest_report_path)
+        elif kind == "screenshot_saved":
+            self._append(stamp, "Screenshot saved: " + event.get("file_path", ""))
         elif kind in ("warning", "error"):
             if kind == "warning" and "continuing without a plan" in event.get("text", ""):
                 self.plan_goal.configure(text="No plan (continuing without one)")
@@ -153,6 +184,126 @@ class App:
         marker = {"pending": "○", "running": "▶", "done": "✓"}[state]
         label.configure(text=f"{marker}  {title}")
 
+    def _task_text(self):
+        return self.task.get("1.0", "end-1c")
+
+    def _replace_task_text(self, text):
+        self._setting_task_text = True
+        try:
+            self.task.delete("1.0", "end")
+            self.task.insert("1.0", text)
+            self.task.edit_modified(False)
+        finally:
+            self._setting_task_text = False
+
+    def _clear_undo(self):
+        self._undo_original = None
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.configure(state="disabled")
+
+    def _task_modified(self, _event=None):
+        if self.task.edit_modified():
+            self.task.edit_modified(False)
+            if not self._setting_task_text:
+                self._clear_undo()
+
+    def undo_improvement(self):
+        if self._undo_original is None:
+            return
+        original = self._undo_original
+        self._replace_task_text(original)
+        self._clear_undo()
+
+    def improve_task(self):
+        original = self._task_text()
+        if not original.strip() or self._improving:
+            return
+        settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
+                    "model": self.model.get().strip()}
+        self._improving = True
+        self.improve_btn.configure(state="disabled")
+        self.run_btn.configure(state="disabled")
+
+        def worker():
+            try:
+                result = improve_prompt(original, settings)
+                error = "" if result else "No suggestion was returned."
+            except Exception as exc:
+                result = None
+                error = " ".join(str(exc).split())[:180] or "The improvement request failed."
+            self.root.after(0, self._improve_finished, original, result, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _improve_finished(self, original, result, error):
+        if error or not result:
+            self._improving = False
+            self.improve_btn.configure(state="normal")
+            self.run_btn.configure(state="normal")
+            messagebox.showwarning("Improve prompt", error or "The model returned no suggestion.", parent=self.root)
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Improved task wording")
+        dialog.geometry("540x430")
+        dialog.transient(self.root)
+
+        def add_text_box(label_text, content):
+            tk.Label(dialog, text=label_text).pack(anchor="w", padx=10, pady=(8, 2))
+            box = tk.Text(dialog, height=4, wrap="word")
+            box.pack(fill="x", padx=10)
+            box.insert("1.0", content)
+            box.configure(state="disabled")
+
+        add_text_box("Original", original)
+        add_text_box("Improved", result["improved"])
+        tk.Label(dialog, text="Changes: " + result["changes"], anchor="w", wraplength=510,
+                 justify="left").pack(fill="x", padx=10, pady=8)
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=8)
+
+        def close_dialog(use_improved):
+            if use_improved:
+                if self._task_text() != original:
+                    messagebox.showwarning("Improve prompt", "The task changed while improving; your current text was kept.",
+                                           parent=dialog)
+                else:
+                    self._undo_original = original
+                    self._replace_task_text(result["improved"])
+                    self.undo_btn.configure(state="normal")
+            dialog.destroy()
+            self._improving = False
+            self.improve_btn.configure(state="normal")
+            self.run_btn.configure(state="normal")
+
+        tk.Button(buttons, text="Use this", command=lambda: close_dialog(True)).pack(side="left")
+        tk.Button(buttons, text="Keep mine", command=lambda: close_dialog(False)).pack(side="left", padx=6)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog(False))
+        dialog.grab_set()
+
+    def open_latest_report(self):
+        if not self.latest_report_path:
+            messagebox.showinfo("Reports", "No report has been saved yet.", parent=self.root)
+            return
+        warning = open_report_in_notepad(self.latest_report_path)
+        if warning:
+            self.emit({"type": "warning", "time": "", "text": warning})
+
+    def open_screenshots_folder(self):
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+        try:
+            os.startfile(SCREENSHOTS_DIR)
+        except Exception as exc:
+            self.emit({"type": "warning", "time": "",
+                       "text": f"Could not open screenshots folder: {exc}"})
+
+    def confirm_clear_screenshots(self):
+        if not messagebox.askyesno("Clear screenshots", "Delete all saved screenshot task folders?", parent=self.root):
+            return
+        removed = clear_screenshot_folders()
+        messagebox.showinfo("Clear screenshots", f"Deleted {len(removed)} screenshot task folder(s).",
+                            parent=self.root)
+
     def open_reports_folder(self):
         os.makedirs(REPORTS_DIR, exist_ok=True)
         try:
@@ -166,15 +317,18 @@ class App:
             with open(CONFIG, "w", encoding="utf-8") as f:
                 json.dump({"base": self.base.get(), "key": self.key.get(), "model": self.model.get(),
                            "browser": self.browser.get().strip(), "vision": self.vision.get(),
-                           "batch_actions": self.batch_actions.get()}, f)
+                           "batch_actions": self.batch_actions.get(),
+                           "open_report_notepad": self.open_report_notepad.get()}, f)
         elif os.path.exists(CONFIG):
             os.remove(CONFIG)
         task = self.task.get("1.0", "end").strip()
         if not task or not self.model.get().strip():
             self.emit({"type": "warning", "time": "", "text": "Enter a model name and a task first."})
             return
+        self._clear_undo()
         self.stop.clear()
         self.run_btn.configure(state="disabled")
+        self.improve_btn.configure(state="disabled")
         for child in self.plan_list.winfo_children():
             child.destroy()
         self.plan_rows.clear()
@@ -182,7 +336,8 @@ class App:
         self.plan_goal.configure(text="Planning…")
         settings = {"base": self.base.get().strip(), "key": self.key.get().strip(),
                     "model": self.model.get().strip(), "browser": self.browser.get().strip(),
-                    "vision": self.vision.get(), "batch_actions": self.batch_actions.get()}
+                    "vision": self.vision.get(), "batch_actions": self.batch_actions.get(),
+                    "open_report_notepad": self.open_report_notepad.get()}
         if settings["vision"]:
             self.root.iconify()
         threading.Thread(target=self._run, args=(task, settings), daemon=True).start()
@@ -196,6 +351,8 @@ class App:
             def restore():
                 self.root.deiconify()
                 self.run_btn.configure(state="normal")
+                if not self._improving:
+                    self.improve_btn.configure(state="normal")
             self.root.after(0, restore)
 
 

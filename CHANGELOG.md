@@ -8,3 +8,7 @@
 - Added `web_search`, SSRF-protected `read_page`, per-task `save_note`, sourced Markdown reports, research events, and an Open Reports Folder button.
 - Added research source/safety instructions and per-task search/page limits. `run.bat` installs `ddgs`, `requests`, and `trafilatura` alongside the existing packages.
 - Added offline fake-client/fake-action and mocked HTTP/DNS research tests.
+- Added asynchronous prompt improvement with confirmation and one-step Undo.
+- Added Notepad report opening with default-app fallback and a saved auto-open preference.
+- Vision screenshots are now saved per task, with click markers, seven-day cleanup, open/clear controls, and live events.
+- Expanded offline tests for prompt improvement, Notepad fallback, screenshot storage, click markers, and cleanup.

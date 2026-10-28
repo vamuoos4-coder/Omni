@@ -1,11 +1,14 @@
 """Offline tests for planner, action batching, event streams, stops, and summaries."""
+import base64
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
 import types
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import engine
@@ -383,7 +386,8 @@ class WebResearchTests(unittest.TestCase):
                              {"text": "A sourced and verified finding.", "source": source}),
                              response("finish", 1, {"message": "Research answer."})])
         events = []
-        settings = {"model": "offline-test", "client": client, "sleep": lambda _seconds: None}
+        settings = {"model": "offline-test", "client": client, "sleep": lambda _seconds: None,
+                    "open_report_notepad": False}
         with tempfile.TemporaryDirectory() as report_dir, patch.object(engine, "REPORTS_DIR", report_dir):
             run_task("research something", settings, events.append, threading.Event())
             summary = events[-1]
@@ -399,6 +403,164 @@ class WebResearchTests(unittest.TestCase):
         self.assertEqual(summary["pages_read"], 0)
         self.assertTrue(any(e["type"] == "note_saved" for e in events))
         self.assertTrue(any(e["type"] == "report_saved" for e in events))
+
+
+class ImprovePromptTests(unittest.TestCase):
+    def test_valid_json_uses_exactly_one_text_only_call(self):
+        payload = json.dumps({"improved": "Please save the document.", "changes": "Corrected grammar and clarified the wording."})
+        client = FakeClient([payload])
+        result = engine.improve_prompt("pls save doc", {"model": "offline", "client": client, "vision": True})
+        self.assertEqual(result["improved"], "Please save the document.")
+        self.assertEqual(result["changes"], "Corrected grammar and clarified the wording.")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0]["temperature"], 0)
+        self.assertEqual(len(client.calls[0]["messages"]), 2)
+        self.assertNotIn("image_url", json.dumps(client.calls[0]["messages"]))
+        self.assertIn("same language", client.calls[0]["messages"][0]["content"])
+
+    def test_invalid_json_raises_value_error(self):
+        client = FakeClient(["not JSON"])
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            engine.improve_prompt("fix this", {"model": "offline", "client": client})
+        self.assertEqual(len(client.calls), 1)
+
+    def test_api_failure_propagates_without_retry(self):
+        class BrokenClient:
+            def __init__(self):
+                self.calls = 0
+                self.chat = types.SimpleNamespace(completions=self)
+            def create(self, **_kwargs):
+                self.calls += 1
+                raise RuntimeError("offline API failure")
+
+        client = BrokenClient()
+        with self.assertRaisesRegex(RuntimeError, "offline API failure"):
+            engine.improve_prompt("fix this", {"model": "offline", "client": client})
+        self.assertEqual(client.calls, 1)
+
+    def test_empty_input_does_not_call_model(self):
+        client = FakeClient([])
+        self.assertIsNone(engine.improve_prompt("  \n", {"model": "offline", "client": client}))
+        self.assertEqual(client.calls, [])
+
+
+class ReportNotepadTests(unittest.TestCase):
+    def test_notepad_launch_arguments(self):
+        with patch("engine.subprocess.Popen") as popen:
+            warning = engine.open_report_in_notepad("C:/reports/report.md")
+        popen.assert_called_once_with(["notepad.exe", "C:/reports/report.md"])
+        self.assertEqual(warning, "")
+
+    def test_notepad_failure_falls_back_and_returns_warning(self):
+        with patch("engine.subprocess.Popen", side_effect=OSError("not found")), \
+             patch.object(engine.os, "startfile", create=True) as startfile:
+            warning = engine.open_report_in_notepad("C:/reports/report.md")
+        startfile.assert_called_once_with("C:/reports/report.md")
+        self.assertIn("Notepad could not open", warning)
+
+    def test_failed_notepad_and_fallback_return_warning(self):
+        with patch("engine.subprocess.Popen", side_effect=OSError("not found")), \
+             patch.object(engine.os, "startfile", side_effect=OSError("no file handler"), create=True):
+            warning = engine.open_report_in_notepad("report.md")
+        self.assertIn("fallback also failed", warning)
+
+    def test_auto_open_happens_after_report_saved_event(self):
+        client = FakeClient([plan_reply(), response("save_note", 1,
+                             {"text": "A fact.", "source": "https://example.test"}),
+                             response("finish", 1, {"message": "Done."})])
+        events = []
+        settings = {"model": "offline", "client": client, "sleep": lambda _s: None,
+                    "open_report_notepad": True}
+        with tempfile.TemporaryDirectory() as report_dir, \
+             patch.object(engine, "REPORTS_DIR", report_dir), \
+             patch.object(engine, "open_report_in_notepad", side_effect=lambda _path:
+                          self.assertEqual(events[-1]["type"], "report_saved") or "") as launcher:
+            run_task("research", settings, events.append, threading.Event())
+        launcher.assert_called_once()
+
+
+class ScreenshotTests(unittest.TestCase):
+    invoke = EngineTests.invoke
+
+    def test_task_folder_file_names_and_safe_slug(self):
+        now = datetime(2025, 4, 5, 6, 7, 8)
+        with tempfile.TemporaryDirectory() as root:
+            folder = engine.create_screenshot_task_dir("Ä VERY wild task!!! with symbols " + "x" * 40,
+                                                       root=root, now=now)
+            slug = engine.safe_task_slug("Ä VERY wild task!!! with symbols " + "x" * 40)
+            self.assertEqual(os.path.basename(folder), "20250405-060708-" + slug)
+            self.assertLessEqual(len(slug), 30)
+            self.assertRegex(slug, r"^[a-z0-9-]+$")
+            fake_image = base64.b64encode(b"fake jpeg bytes").decode("ascii")
+            base_path = engine.save_screenshot(fake_image, folder, 1)
+            self.assertEqual(os.path.basename(base_path), "step-01.jpg")
+            with open(base_path, "rb") as image_file:
+                self.assertEqual(image_file.read(), b"fake jpeg bytes")
+
+    def test_click_marker_file_is_saved(self):
+        fake_image = base64.b64encode(b"fake jpeg").decode("ascii")
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(engine, "_click_marker_image", return_value=b"fake marked jpeg"):
+            marker_path = engine.save_click_marker(fake_image, folder, 7,
+                                                   {"cell": "D3", "dx": 0.2, "dy": 0.7})
+            self.assertEqual(os.path.basename(marker_path), "step-07-click.jpg")
+            with open(marker_path, "rb") as marker_file:
+                self.assertEqual(marker_file.read(), b"fake marked jpeg")
+
+    def test_cleanup_removes_only_folders_older_than_seven_days(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as root:
+            old_folder = os.path.join(root, "old-task")
+            new_folder = os.path.join(root, "new-task")
+            os.makedirs(old_folder)
+            os.makedirs(new_folder)
+            os.utime(old_folder, (now - 8 * 86400, now - 8 * 86400))
+            os.utime(new_folder, (now - 2 * 86400, now - 2 * 86400))
+            removed = engine.cleanup_screenshot_folders(root=root, now=now)
+            self.assertEqual(removed, [old_folder])
+            self.assertFalse(os.path.exists(old_folder))
+            self.assertTrue(os.path.isdir(new_folder))
+
+    def test_vision_saves_current_screenshot_and_click_marker(self):
+        client = FakeClient([plan_reply(), response("click", 1, {"cell": "H5"}),
+                             response("finish", 1, {"message": "Clicked."})])
+        fake_images = [base64.b64encode(b"jpeg one").decode("ascii"),
+                       base64.b64encode(b"jpeg two").decode("ascii")]
+        events = []
+        settings = {"model": "offline", "client": client, "vision": True,
+                    "sleep": lambda _s: None, "action_runner": lambda *_: "clicked",
+                    "open_report_notepad": False}
+        with tempfile.TemporaryDirectory() as screenshot_root, \
+             patch.object(engine, "SCREENSHOTS_DIR", screenshot_root), \
+             patch.object(engine, "grab", side_effect=fake_images), \
+             patch.object(engine, "_click_marker_image", return_value=b"fake click marker"):
+            run_task("Open a page!", settings, events.append, threading.Event())
+            task_dirs = os.listdir(screenshot_root)
+            self.assertEqual(len(task_dirs), 1)
+            task_dir = os.path.join(screenshot_root, task_dirs[0])
+            self.assertEqual(sorted(os.listdir(task_dir)),
+                             ["step-01-click.jpg", "step-01.jpg", "step-02.jpg"])
+            with open(os.path.join(task_dir, "step-02.jpg"), "rb") as f:
+                self.assertEqual(f.read(), b"jpeg two")
+            screenshot_events = [event for event in events if event["type"] == "screenshot_saved"]
+            self.assertEqual(len(screenshot_events), 3)
+            self.assertTrue(all(os.path.isfile(event["file_path"]) for event in screenshot_events))
+        # The second model action turn has the new image only; earlier images are not replayed.
+        vision_messages = client.calls[2]["messages"]
+        image_urls = [part["image_url"]["url"] for message in vision_messages
+                      if isinstance(message.get("content"), list) for part in message["content"]
+                      if part.get("type") == "image_url"]
+        self.assertEqual(image_urls, ["data:image/jpeg;base64," + fake_images[1]])
+
+    def test_vision_off_creates_no_screenshot_folder(self):
+        client = FakeClient([plan_reply(), response("finish", 1, {"message": "done"})])
+        with tempfile.TemporaryDirectory() as parent:
+            screenshot_root = os.path.join(parent, "screenshots")
+            with patch.object(engine, "SCREENSHOTS_DIR", screenshot_root), \
+                 patch.object(engine, "grab", side_effect=AssertionError("vision is off")):
+                events = self.invoke(client, settings_extra={"vision": False})
+            self.assertFalse(os.path.exists(screenshot_root))
+            self.assertFalse(any(event["type"] == "screenshot_saved" for event in events))
 
 
 if __name__ == "__main__":
